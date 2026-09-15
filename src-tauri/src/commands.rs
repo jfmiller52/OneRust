@@ -147,6 +147,22 @@ pub async fn ensure_onecli_ready(app: AppHandle) -> Result<String, String> {
             total: 1,
         },
     );
+
+    if crate::lenovo::find_onecli().await.is_none() {
+        let _ = app.emit(
+            "download-progress",
+            DownloadProgress {
+                machine_type: "ONECLI".into(),
+                model_name: "Lenovo OneCLI".into(),
+                status: "downloading".into(),
+                path: Some(crate::lenovo::preferred_onecli_dir().display().to_string()),
+                error: None,
+                index: 0,
+                total: 1,
+            },
+        );
+    }
+
     match crate::lenovo::ensure_onecli().await {
         Ok(path) => {
             let path_str = path.display().to_string();

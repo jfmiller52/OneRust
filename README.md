@@ -11,10 +11,11 @@ Built with **Tauri 2**, **React**, and **shadcn-style** UI components.
 - Windows (OneCLI path and PowerShell helpers are Windows-oriented)
 - [Node.js](https://nodejs.org/) 20+
 - [Rust](https://rustup.rs/) (stable) with MSVC toolchain
-- Unzipped [Lenovo XClarity Essentials OneCLI](https://datacentersupport.lenovo.com/) in a folder named **`OneCLI`** next to the app (cwd or beside the executable), so `OneCLI/OneCli.exe` is reachable
 - Network access from this PC to:
   - Target BMC/XCC management IPs
-  - Lenovo download/support sites when acquiring packages (`download.lenovo.com`, `support.lenovo.com`)
+  - Lenovo download/support sites (`download.lenovo.com`, `support.lenovo.com`)
+
+On **first run**, if `OneCLI/OneCli.exe` is not already next to the executable, OneRust downloads Lenovo OneCLI and extracts it into an `OneCLI/` folder beside the app.
 
 ## Quick start
 
@@ -49,7 +50,7 @@ Per-host progress is written under `logs/<SERIAL>.log`. Compare artifacts go und
 
 ```text
 OneRust/
-  OneCLI/          # required: unzipped OneCLI (not committed)
+  OneCLI/          # auto-downloaded on first run if missing (not committed)
   firmware/        # acquired packages per machine type
   logs/            # per-serial update logs + compare output
   src/             # React UI
@@ -61,7 +62,7 @@ OneRust/
 - Targets **V3/V4 only** (XCC2/XCC3 multipart update). Older XCC1 / UXSP flows are out of scope.
 - BMC TLS verification is off by default (self-signed XCC certs). Enable “Verify BMC TLS” in the UI if needed.
 - Host reboot uses Redfish `ComputerSystem.Reset` (`ForceRestart`, with graceful fallback when requested).
-- OneCLI, firmware downloads, and logs are gitignored — keep them local.
+- OneCLI, firmware downloads, and logs are gitignored — keep them local. OneCLI is bootstrapped automatically on first launch when missing.
 
 ## License
 

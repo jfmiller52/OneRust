@@ -1,13 +1,20 @@
 //! Firmware acquisition via Lenovo XClarity Essentials OneCLI.
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::StreamExt;
 use reqwest::Client;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+/// Official OneCLI Windows package used when bootstrapping beside the app.
+pub const ONECLI_DOWNLOAD_URL: &str =
+    "https://download.lenovo.com/servers/mig/2026/09/02/65219/lnvgy_utl_lxce_onecli01m-5.7.0_windows_indiv.zip";
+
+const ONECLI_ZIP_NAME: &str = "lnvgy_utl_lxce_onecli01m-5.7.0_windows_indiv.zip";
 const USER_AGENT: &str = "OneRust/0.1";
 
 /// HTTP client (kept for shared use; firmware acquire uses OneCLI).
@@ -20,19 +27,33 @@ pub fn download_client() -> Result<Client> {
         .context("build HTTP client")
 }
 
-/// Expected OneCLI install directory: `<app_dir>/OneCLI`.
+/// Preferred install dir: `OneCLI` beside the running executable.
+pub fn preferred_onecli_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("OneCLI");
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("OneCLI")
+}
+
+/// Candidate OneCLI locations (existing installs), preferred first.
 pub fn onecli_dir_candidates() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
+    let preferred = preferred_onecli_dir();
+    dirs.push(preferred.clone());
+
     if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join("OneCLI"));
+        let cwd_onecli = cwd.join("OneCLI");
+        if cwd_onecli != preferred && !dirs.iter().any(|d| d == &cwd_onecli) {
+            dirs.push(cwd_onecli);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let beside_exe = parent.join("OneCLI");
-            if !dirs.iter().any(|d| d == &beside_exe) {
-                dirs.push(beside_exe);
-            }
-            // During `cargo run` / `tauri dev`, exe is often under target/*/ — also try repo root.
+            // During `tauri dev`, also try workspace root (two levels up from target/*/).
             if let Some(grand) = parent.parent().and_then(|p| p.parent()) {
                 let repo = grand.join("OneCLI");
                 if !dirs.iter().any(|d| d == &repo) {
@@ -44,7 +65,7 @@ pub fn onecli_dir_candidates() -> Vec<PathBuf> {
     dirs
 }
 
-/// Locate `OneCli.exe` under the app's `OneCLI` folder.
+/// Locate `OneCli.exe` under a known `OneCLI` folder.
 pub async fn find_onecli() -> Option<PathBuf> {
     for dir in onecli_dir_candidates() {
         if let Ok(found) = find_onecli_under(&dir).await {
@@ -58,7 +79,6 @@ async fn find_onecli_under(dir: &Path) -> Result<PathBuf> {
     if !dir.is_dir() {
         bail!("OneCLI dir missing: {}", dir.display());
     }
-    // Prefer OneCLI/OneCli.exe directly, then search recursively.
     let direct = dir.join("OneCli.exe");
     if direct.is_file() {
         return Ok(direct);
@@ -82,20 +102,101 @@ async fn find_onecli_under(dir: &Path) -> Result<PathBuf> {
     bail!("OneCli.exe not found under {}", dir.display());
 }
 
-/// Resolve OneCLI from `<app>/OneCLI` (no download).
+/// Resolve OneCLI beside the app, downloading and extracting on first run if missing.
 pub async fn ensure_onecli() -> Result<PathBuf> {
     if let Some(existing) = find_onecli().await {
         return Ok(existing);
     }
-    let tried = onecli_dir_candidates()
-        .into_iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!(
-        "OneCLI not found. Unzip Lenovo OneCLI into a folder named OneCLI next to the app \
-         (looked in: {tried})"
-    )
+
+    let client = download_client()?;
+    let dest_dir = preferred_onecli_dir();
+    let parent = dest_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&parent)
+        .await
+        .with_context(|| format!("create {}", parent.display()))?;
+    fs::create_dir_all(&dest_dir)
+        .await
+        .with_context(|| format!("create {}", dest_dir.display()))?;
+
+    let zip_path = parent.join(ONECLI_ZIP_NAME);
+    if !zip_path.is_file() {
+        download_file(&client, ONECLI_DOWNLOAD_URL, &zip_path).await?;
+    }
+
+    extract_zip(&zip_path, &dest_dir)
+        .await
+        .with_context(|| format!("extract OneCLI to {}", dest_dir.display()))?;
+
+    find_onecli_under(&dest_dir).await.with_context(|| {
+        format!(
+            "OneCLI downloaded to {} but OneCli.exe was not found after extract",
+            dest_dir.display()
+        )
+    })
+}
+
+async fn download_file(client: &Client, url: &str, dest: &Path) -> Result<()> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        bail!("download {url} failed: HTTP {}", resp.status());
+    }
+
+    let tmp = dest.with_extension("partial");
+    let mut file = fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("create {}", tmp.display()))?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("download stream")?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
+    Ok(())
+}
+
+/// Extract a zip using PowerShell Expand-Archive, with `tar` fallback.
+async fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
+    let zip_str = zip_path.to_string_lossy().replace('\'', "''");
+    let dest_str = dest_dir.to_string_lossy().replace('\'', "''");
+    let ps = format!(
+        "Expand-Archive -LiteralPath '{zip_str}' -DestinationPath '{dest_str}' -Force"
+    );
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status()
+        .await
+        .context("run Expand-Archive")?;
+    if status.success() {
+        return Ok(());
+    }
+
+    let status = Command::new("tar")
+        .args([
+            "-xf",
+            &zip_path.to_string_lossy(),
+            "-C",
+            &dest_dir.to_string_lossy(),
+        ])
+        .status()
+        .await
+        .context("run tar extract")?;
+    if !status.success() {
+        bail!("failed to extract {}", zip_path.display());
+    }
+    Ok(())
 }
 
 /// Run OneCLI update acquire for a machine type into `firmware/<mt>/`.
@@ -472,6 +573,13 @@ mod tests {
     fn onecli_dir_is_named_onecli() {
         let dirs = onecli_dir_candidates();
         assert!(dirs.iter().any(|d| d.ends_with("OneCLI")));
+        assert!(preferred_onecli_dir().ends_with("OneCLI"));
+    }
+
+    #[test]
+    fn onecli_url_is_windows_zip() {
+        assert!(ONECLI_DOWNLOAD_URL.contains("onecli"));
+        assert!(ONECLI_DOWNLOAD_URL.ends_with(".zip"));
     }
 
     #[test]

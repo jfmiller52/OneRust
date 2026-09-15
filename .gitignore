@@ -10,6 +10,8 @@
 # Local Lenovo OneCLI install (not source)
 /OneCLI/
 **/OneCLI/
+lnvgy_utl_lxce_onecli*.zip
+**/lnvgy_utl_lxce_onecli*.zip
 
 # OneCLI / firmware downloads must stay local
 /tools/

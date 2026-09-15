@@ -81,11 +81,31 @@ export default function App() {
   const [hostProgress, setHostProgress] = useState<Record<string, HostProgress>>({});
   const [results, setResults] = useState<HostResult[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [onecliStatus, setOnecliStatus] = useState<string>("checking");
 
   useEffect(() => {
     listModels()
       .then(setModels)
       .catch((e) => setError(String(e)));
+  }, []);
+
+  // First run: ensure OneCLI exists beside the executable (download if needed).
+  useEffect(() => {
+    let cancelled = false;
+    setOnecliStatus("checking");
+    ensureOnecliReady()
+      .then((path) => {
+        if (!cancelled) setOnecliStatus(`ready: ${path}`);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          setOnecliStatus("error");
+          setError(`OneCLI setup failed: ${String(e)}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -95,6 +115,9 @@ export default function App() {
         const next = [...prev.filter((x) => x.machineType !== p.machineType), p];
         return next.sort((a, b) => a.index - b.index);
       });
+      if (p.machineType === "ONECLI") {
+        setOnecliStatus(p.status);
+      }
     }).then((u) => unsubs.push(u));
     onHostProgress((p) => {
       setHostProgress((prev) => ({ ...prev, [p.ip]: p }));
@@ -349,14 +372,20 @@ export default function App() {
               <div>
                 <h2 className="text-lg font-medium">Download Update Bundles</h2>
                 <p className="mt-1 text-sm text-rack-400">
-                  Uses Lenovo OneCLI from the local{" "}
-                  <span className="font-mono text-rack-300">OneCLI/</span> folder (
+                  Uses Lenovo OneCLI from{" "}
+                  <span className="font-mono text-rack-300">OneCLI/</span> beside
+                  the app (
                   <span className="font-mono text-rack-300">update acquire --zip</span>
                   ) for{" "}
                   <span className="font-mono text-rack-300">
                     {machineTypes.join(", ")}
                   </span>
-                  . Place an unzipped OneCLI install next to the app before acquiring.
+                  . On first run, OneCLI is downloaded automatically if missing
+                  {onecliStatus.startsWith("ready")
+                    ? " (ready)."
+                    : onecliStatus === "downloading" || onecliStatus === "checking"
+                      ? ` (${onecliStatus}…).`
+                      : "."}
                 </p>
               </div>
               <div className="flex items-center gap-3">
