@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  --color-rack-950: #0a0e12;
+  --color-rack-900: #0f1419;
+  --color-rack-850: #151b22;
+  --color-rack-800: #1a222c;
+  --color-rack-700: #243040;
+  --color-rack-600: #3a4a5c;
+  --color-rack-400: #8a9bb0;
+  --color-rack-300: #b8c5d4;
+  --color-rack-100: #e8eef5;
+
+  --color-signal: #3d9bfd;
+  --color-signal-dim: #1e4f80;
+  --color-ok: #3ecf8e;
+  --color-warn: #e6a23c;
+  --color-bad: #e85d5d;
+
+  --color-background: var(--color-rack-900);
+  --color-foreground: var(--color-rack-100);
+  --color-card: var(--color-rack-850);
+  --color-card-foreground: var(--color-rack-100);
+  --color-primary: var(--color-signal);
+  --color-primary-foreground: #041018;
+  --color-secondary: var(--color-rack-800);
+  --color-secondary-foreground: var(--color-rack-100);
+  --color-muted: var(--color-rack-800);
+  --color-muted-foreground: var(--color-rack-400);
+  --color-accent: var(--color-rack-700);
+  --color-accent-foreground: var(--color-rack-100);
+  --color-destructive: var(--color-bad);
+  --color-border: #2a3544;
+  --color-input: #2a3544;
+  --color-ring: var(--color-signal);
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 10% -10%, rgba(61, 155, 253, 0.12), transparent),
+      linear-gradient(180deg, #0f1419 0%, #0a0e12 100%);
+  }
+}

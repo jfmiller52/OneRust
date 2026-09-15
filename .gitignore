@@ -1,0 +1,20 @@
+/target
+/src-tauri/target
+/node_modules
+/dist
+/logs/
+**/logs/
+*.partial
+.DS_Store
+
+# Local Lenovo OneCLI install (not source)
+/OneCLI/
+**/OneCLI/
+
+# OneCLI / firmware downloads must stay local
+/tools/
+**/tools/
+/firmware/
+**/firmware/
+/src-tauri/tools/
+/src-tauri/firmware/
