@@ -31,13 +31,14 @@ const STEPS: { id: Step; label: string; icon: typeof Cpu }[] = [
   { id: "models", label: "Models", icon: Cpu },
   { id: "firmware", label: "Firmware", icon: Download },
   { id: "targets", label: "Targets", icon: Server },
-  { id: "run", label: "Stage", icon: Play },
+  { id: "run", label: "Update", icon: Play },
 ];
 
 function statusColor(status: string) {
   switch (status) {
     case "ready":
     case "staged":
+    case "verified":
       return "text-ok";
     case "failed":
     case "error":
@@ -46,7 +47,12 @@ function statusColor(status: string) {
     case "queued":
       return "text-warn";
     case "running":
+    case "staging":
+    case "rebooting":
+    case "applying":
+    case "verifying":
     case "downloading":
+    case "checking":
       return "text-signal";
     default:
       return "text-rack-400";
@@ -210,10 +216,11 @@ export default function App() {
   };
 
   const summary = useMemo(() => {
+    const verified = results.filter((r) => r.outcome === "verified").length;
     const staged = results.filter((r) => r.outcome === "staged").length;
     const failed = results.filter((r) => r.outcome === "failed").length;
     const skipped = results.filter((r) => r.outcome === "skipped").length;
-    return { staged, failed, skipped };
+    return { verified, staged, failed, skipped };
   }, [results]);
 
   const downloadPct =
@@ -233,12 +240,12 @@ export default function App() {
             OneRust
           </h1>
           <span className="font-mono text-xs text-rack-400">
-            ThinkSystem V3/V4 · Redfish · OnReset
+            ThinkSystem V3/V4 · Redfish · reboot + verify
           </span>
         </div>
         <div className="flex items-center gap-2 text-xs text-rack-400">
           <Shield className="size-3.5 text-signal" />
-          Stage only — applies on next host reset
+          Stage → reboot → OneCLI compare
         </div>
       </header>
 
@@ -501,7 +508,7 @@ export default function App() {
               <Button variant="outline" onClick={() => setStep("firmware")}>
                 Back
               </Button>
-              <Button onClick={goRun}>Continue to stage</Button>
+              <Button onClick={goRun}>Continue to update</Button>
             </div>
           </section>
         )}
@@ -510,15 +517,16 @@ export default function App() {
           <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
-                <h2 className="text-lg font-medium">Stage firmware (OnReset)</h2>
+                <h2 className="text-lg font-medium">Update, reboot &amp; verify</h2>
                 <p className="mt-1 text-sm text-rack-400">
-                  Uploads bundles to each XCC. Activation waits for the next host
-                  power reset. Per-serial logs land in{" "}
+                  Stages the Update Bundle (OnReset), force-restarts each host,
+                  then runs OneCLI compare until no further firmware updates are
+                  recommended. Logs:{" "}
                   <span className="font-mono text-rack-300">{logsDir}/</span>
                 </p>
               </div>
               <Button onClick={runUpdates} disabled={running}>
-                {running ? "Staging…" : "Start staging"}
+                {running ? "Updating…" : "Start update"}
               </Button>
             </div>
 
@@ -556,8 +564,9 @@ export default function App() {
             </ScrollArea>
 
             {results.length > 0 && (
-              <div className="flex gap-6 font-mono text-sm">
-                <span className="text-ok">staged {summary.staged}</span>
+              <div className="flex flex-wrap gap-6 font-mono text-sm">
+                <span className="text-ok">verified {summary.verified}</span>
+                <span className="text-signal">staged {summary.staged}</span>
                 <span className="text-bad">failed {summary.failed}</span>
                 <span className="text-warn">skipped {summary.skipped}</span>
               </div>

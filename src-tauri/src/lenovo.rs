@@ -241,6 +241,214 @@ pub async fn acquire_bundle_for_mt(
     onecli_acquire(&onecli, mt, firmware_root).await
 }
 
+/// Result of OneCLI `update compare` against a live BMC.
+#[derive(Debug, Clone)]
+pub struct CompareOutcome {
+    pub packages_needed: usize,
+    pub summary: String,
+    pub output_dir: PathBuf,
+}
+
+/// Compare installed firmware on a BMC to local packages; `packages_needed == 0` means up to date.
+pub async fn onecli_compare(
+    bmc_user: &str,
+    bmc_pass: &str,
+    bmc_ip: &str,
+    package_dir: &Path,
+    output_dir: &Path,
+) -> Result<CompareOutcome> {
+    let onecli = ensure_onecli().await?;
+    fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create {}", output_dir.display()))?;
+
+    let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
+    let output = Command::new(&onecli)
+        .args([
+            "update",
+            "compare",
+            "--bmc",
+            &bmc,
+            "--dir",
+            &package_dir.to_string_lossy(),
+            "--type",
+            "fw",
+            "--scope",
+            "latest",
+            "--ostype",
+            "none",
+            "--output",
+            &output_dir.to_string_lossy(),
+            "--quiet",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawn {}", onecli.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}\n{stderr}");
+
+    // Persist raw output for the serial log folder consumers
+    let _ = fs::write(output_dir.join("compare-stdout.txt"), &stdout).await;
+    let _ = fs::write(output_dir.join("compare-stderr.txt"), &stderr).await;
+
+    let packages_needed = count_packages_needed(output_dir, &combined).await?;
+
+    if !output.status.success() && packages_needed == 0 {
+        // OneCLI sometimes exits non-zero even when compare produced usable XML.
+        // Only hard-fail when we also couldn't interpret a clean result.
+        if !combined.to_lowercase().contains("compare")
+            && !dir_has_xml(output_dir).await.unwrap_or(false)
+        {
+            bail!(
+                "OneCLI compare failed (exit {:?}): {}",
+                output.status.code(),
+                truncate(&combined, 800)
+            );
+        }
+    }
+
+    let summary = if packages_needed == 0 {
+        "OneCLI compare: no firmware updates required".to_string()
+    } else {
+        format!("OneCLI compare: {packages_needed} firmware package(s) still recommended")
+    };
+
+    Ok(CompareOutcome {
+        packages_needed,
+        summary,
+        output_dir: output_dir.to_path_buf(),
+    })
+}
+
+async fn dir_has_xml(dir: &Path) -> Result<bool> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries = fs::read_dir(&current).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("xml"))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Heuristic: count packages OneCLI still wants to apply from compare XML / console text.
+pub async fn count_packages_needed(output_dir: &Path, console: &str) -> Result<usize> {
+    let lower = console.to_lowercase();
+    if lower.contains("no package")
+        || lower.contains("no updates")
+        || lower.contains("0 package")
+        || lower.contains("nothing to update")
+        || lower.contains("system is up to date")
+    {
+        return Ok(0);
+    }
+
+    let mut xml_blob = String::new();
+    let mut stack = vec![output_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(mut entries) = fs::read_dir(&current).await else {
+            continue;
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if name.ends_with(".xml")
+                && (name.contains("compare")
+                    || name.contains("result")
+                    || name.contains("common")
+                    || name.contains("package"))
+            {
+                if let Ok(text) = fs::read_to_string(&path).await {
+                    xml_blob.push_str(&text);
+                    xml_blob.push('\n');
+                }
+            }
+        }
+    }
+
+    if xml_blob.is_empty() {
+        // Fall back: scan console for "update required" style lines
+        let hits = lower
+            .lines()
+            .filter(|l| {
+                (l.contains("update") || l.contains("upgrade") || l.contains("flash"))
+                    && (l.contains("required")
+                        || l.contains("recommend")
+                        || l.contains("available")
+                        || l.contains("outdated"))
+            })
+            .count();
+        return Ok(hits);
+    }
+
+    Ok(count_update_packages_in_xml(&xml_blob))
+}
+
+/// Count Package nodes that look like they still need flashing.
+pub fn count_update_packages_in_xml(xml: &str) -> usize {
+    let lower = xml.to_lowercase();
+    // Explicit "no update" markers inside package nodes
+    if lower.contains("<compareresult>noupdate</compareresult>")
+        || lower.contains("<compareresult>no update</compareresult>")
+        || lower.contains("<compareresult>current</compareresult>")
+        || lower.contains("<compareresult>uptodate</compareresult>")
+    {
+        // Count only packages marked as needing update
+        let mut needed = 0usize;
+        for chunk in lower.split("<package").skip(1) {
+            if chunk.contains("<compareresult>update</compareresult>")
+                || chunk.contains("<compareresult>upgrade</compareresult>")
+                || chunk.contains("<compareresult>notinstalled</compareresult>")
+                || chunk.contains("<compareresult>downgrade</compareresult>")
+                || chunk.contains("updaterequired>true")
+                || chunk.contains("<tobeflashed>true")
+            {
+                needed += 1;
+            }
+        }
+        return needed;
+    }
+
+    // If CompareResult=Update style appears globally
+    let update_markers = lower.matches("<compareresult>update</compareresult>").count()
+        + lower.matches("<compareresult>upgrade</compareresult>").count()
+        + lower.matches("updaterequired>true").count()
+        + lower.matches("<tobeflashed>true").count();
+    if update_markers > 0 {
+        return update_markers;
+    }
+
+    // Some OneCLI builds emit a flash list of Package IDs only when updates are needed.
+    // If we only see Package nodes without clear "current" markers, treat each as needed.
+    let package_opens = lower.matches("<package").count();
+    if package_opens == 0 {
+        return 0;
+    }
+    // Prefer conservative: if XML has packages but no clear up-to-date markers, count them.
+    package_opens
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -264,5 +472,27 @@ mod tests {
     fn onecli_dir_is_named_onecli() {
         let dirs = onecli_dir_candidates();
         assert!(dirs.iter().any(|d| d.ends_with("OneCLI")));
+    }
+
+    #[test]
+    fn compare_xml_no_updates() {
+        let xml = r#"
+            <Packages>
+              <Package><Name>UEFI</Name><CompareResult>NoUpdate</CompareResult></Package>
+              <Package><Name>XCC</Name><CompareResult>Current</CompareResult></Package>
+            </Packages>
+        "#;
+        assert_eq!(count_update_packages_in_xml(xml), 0);
+    }
+
+    #[test]
+    fn compare_xml_needs_updates() {
+        let xml = r#"
+            <Packages>
+              <Package><Name>UEFI</Name><CompareResult>Update</CompareResult></Package>
+              <Package><Name>XCC</Name><CompareResult>NoUpdate</CompareResult></Package>
+            </Packages>
+        "#;
+        assert_eq!(count_update_packages_in_xml(xml), 1);
     }
 }

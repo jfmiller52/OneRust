@@ -4,7 +4,7 @@ use crate::catalog::{
     machine_types_from_selection, model_name_for_mt, MODELS,
 };
 use crate::lenovo::{acquire_bundle_for_mt, download_client};
-use crate::update::{parse_hosts_text, run_concurrent, HostOutcome, TargetHost};
+use crate::update::{parse_hosts_text, run_concurrent, HostOutcome, TargetHost, UpdateOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -78,6 +78,23 @@ pub struct UpdateRequest {
     pub machine_types: Vec<String>,
     /// Optional map of MT -> local zip path overrides
     pub bundle_overrides: Option<HashMap<String, String>>,
+    /// After staging, reboot the host so OnReset firmware applies (default true).
+    #[serde(default = "default_true")]
+    pub reboot_after_stage: bool,
+    /// ForceRestart (default) or GracefulRestart.
+    #[serde(default = "default_reset_type")]
+    pub reset_type: String,
+    /// After reboot, run OneCLI compare and require zero remaining updates (default true).
+    #[serde(default = "default_true")]
+    pub verify_with_compare: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_reset_type() -> String {
+    "ForceRestart".into()
 }
 
 #[tauri::command]
@@ -311,6 +328,12 @@ pub async fn start_updates(
         bundles_by_mt,
         logs_dir,
         request.concurrency.max(1),
+        UpdateOptions {
+            reboot_after_stage: request.reboot_after_stage,
+            reset_type: request.reset_type,
+            verify_with_compare: request.verify_with_compare,
+            ..UpdateOptions::default()
+        },
         Some(on_progress),
     )
     .await;
@@ -318,6 +341,9 @@ pub async fn start_updates(
     let mut dtos = Vec::new();
     for (ip, outcome) in results {
         let (serial, status, detail) = match &outcome {
+            HostOutcome::Verified { serial, detail } => {
+                (serial.clone(), "verified".to_string(), detail.clone())
+            }
             HostOutcome::Staged { serial, detail } => {
                 (serial.clone(), "staged".to_string(), detail.clone())
             }

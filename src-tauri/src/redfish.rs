@@ -172,6 +172,175 @@ impl RedfishClient {
         Ok(())
     }
 
+    async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
+        let resp = self
+            .client
+            .post(self.url(path))
+            .basic_auth(&self.user, Some(&self.pass))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !(status.is_success()
+            || status == StatusCode::ACCEPTED
+            || status == StatusCode::NO_CONTENT)
+        {
+            bail!("POST {path} -> HTTP {status}: {}", truncate(&text, 300));
+        }
+        if text.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text })))
+    }
+
+    /// Current host power state from Systems/1 (e.g. On, Off, PoweringOn).
+    pub async fn power_state(&self) -> Result<String> {
+        let sys = self.get_json("/redfish/v1/Systems/1").await?;
+        Ok(sys
+            .get("PowerState")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string())
+    }
+
+    /// Trigger a host reset so OnReset firmware applies.
+    pub async fn reset_host(&self, reset_type: &str, log: &HostLogger) -> Result<()> {
+        log.info(&format!(
+            "POST ComputerSystem.Reset ResetType={reset_type}"
+        ));
+        let body = json!({ "ResetType": reset_type });
+        match self
+            .post_json("/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", &body)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if reset_type == "GracefulRestart" => {
+                log.warn(&format!(
+                    "GracefulRestart failed ({e:#}); trying ForceRestart"
+                ));
+                self.post_json(
+                    "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+                    &json!({ "ResetType": "ForceRestart" }),
+                )
+                .await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wait until Redfish stops answering (host/BMC briefly unavailable after reset).
+    pub async fn wait_until_unreachable(
+        &self,
+        log: &HostLogger,
+        timeout: Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        log.info("Waiting for BMC/host to go unreachable after reset…");
+        loop {
+            if start.elapsed() > timeout {
+                log.warn("BMC never went unreachable; continuing anyway");
+                return Ok(());
+            }
+            match self.power_state().await {
+                Ok(state) => {
+                    log.info(&format!("still reachable (PowerState={state})"));
+                }
+                Err(_) => {
+                    log.info("BMC unreachable — reset is in progress");
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
+
+    /// Wait until Redfish answers again and PowerState is On (or PoweringOn settles).
+    pub async fn wait_until_ready(&self, log: &HostLogger, timeout: Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+        log.info(&format!(
+            "Waiting for BMC/host to return (timeout {} min)…",
+            timeout.as_secs() / 60
+        ));
+        let mut consecutive_ok = 0u32;
+        loop {
+            if start.elapsed() > timeout {
+                bail!(
+                    "timed out waiting for host to return after {}s",
+                    start.elapsed().as_secs()
+                );
+            }
+            match self.power_state().await {
+                Ok(state) => {
+                    log.info(&format!("BMC reachable, PowerState={state}"));
+                    if state.eq_ignore_ascii_case("On") {
+                        consecutive_ok += 1;
+                        if consecutive_ok >= 3 {
+                            // Brief settle so LXUM/IB apply can finish posting inventory
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return Ok(());
+                        }
+                    } else {
+                        consecutive_ok = 0;
+                    }
+                }
+                Err(e) => {
+                    consecutive_ok = 0;
+                    if start.elapsed().as_secs() % 60 < 15 {
+                        log.info(&format!("still waiting: {e:#}"));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    }
+
+    /// Poll a JobService job until Completed / Exception (or timeout).
+    pub async fn wait_for_job(
+        &self,
+        job_uri: &str,
+        log: &HostLogger,
+        timeout: Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        log.info(&format!("Monitoring update job {job_uri}"));
+        loop {
+            if start.elapsed() > timeout {
+                bail!("timed out waiting for job {job_uri}");
+            }
+            match self.get_json(job_uri).await {
+                Ok(job) => {
+                    let state = job
+                        .get("JobState")
+                        .or_else(|| job.get("TaskState"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let pct = job
+                        .get("PercentComplete")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    log.info(&format!("Job state={state} percent={pct}"));
+                    match state {
+                        "Completed" | "CompletedWithWarnings" => return Ok(()),
+                        "Exception" | "Cancelled" | "Interrupted" => {
+                            bail!(
+                                "update job failed: {state}: {}",
+                                collect_messages(&job)
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => log.warn(&format!("job poll: {e:#}")),
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    }
+
     /// Read Systems/1 identity and derive machine type.
     pub async fn identify(&self, log: &HostLogger) -> Result<HostIdentity> {
         log.info("GET /redfish/v1/Systems/1");
