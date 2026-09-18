@@ -1,9 +1,12 @@
 //! Tauri command handlers for the OneRust GUI.
 
+use crate::blueprint::{
+    apply_blueprint_concurrent, classify_blueprint_file, BlueprintApplyOptions, BlueprintKind,
+};
 use crate::catalog::{
     machine_types_from_selection, model_name_for_mt, MODELS,
 };
-use crate::lenovo::{acquire_bundle_for_mt, download_client};
+use crate::lenovo::acquire_bundle_for_mt;
 use crate::update::{parse_hosts_text, run_concurrent, HostOutcome, TargetHost, UpdateOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -204,7 +207,6 @@ pub async fn download_bundles(
     app: AppHandle,
     request: DownloadRequest,
 ) -> Result<HashMap<String, String>, String> {
-    let client = download_client().map_err(|e| e.to_string())?;
     let firmware_dir = PathBuf::from(&request.firmware_dir);
     let total = request.machine_types.len();
     let mut map = HashMap::new();
@@ -226,7 +228,7 @@ pub async fn download_bundles(
             },
         );
 
-        match acquire_bundle_for_mt(&client, mt, &firmware_dir, request.offline).await {
+        match acquire_bundle_for_mt(mt, &firmware_dir, request.offline).await {
             Ok(path) => {
                 let path_str = path.display().to_string();
                 let _ = app.emit(
@@ -283,7 +285,6 @@ pub async fn start_updates(
         return Err("Password is required".into());
     }
 
-    let client = download_client().map_err(|e| e.to_string())?;
     let firmware_dir = PathBuf::from(&request.firmware_dir);
     let logs_dir = PathBuf::from(&request.logs_dir);
     std::fs::create_dir_all(&logs_dir).map_err(|e| e.to_string())?;
@@ -300,7 +301,7 @@ pub async fn start_updates(
         if bundles_by_mt.contains_key(mt) {
             continue;
         }
-        let path = acquire_bundle_for_mt(&client, mt, &firmware_dir, request.offline)
+        let path = acquire_bundle_for_mt(mt, &firmware_dir, request.offline)
             .await
             .map_err(|e| format!("Bundle for {mt}: {e:#}"))?;
         bundles_by_mt.insert(mt.clone(), path);
@@ -322,7 +323,7 @@ pub async fn start_updates(
         );
     }
 
-    let insecure_tls = !request.verify_bmc_tls;
+    let never_check_trust = !request.verify_bmc_tls;
     let app_progress = app.clone();
     let on_progress: crate::update::ProgressCallback = std::sync::Arc::new(move |ip, status, serial, detail| {
         let _ = app_progress.emit(
@@ -340,7 +341,7 @@ pub async fn start_updates(
         hosts,
         request.username,
         request.password,
-        insecure_tls,
+        never_check_trust,
         bundles_by_mt,
         logs_dir,
         request.concurrency.max(1),
@@ -389,5 +390,160 @@ pub async fn start_updates(
         });
     }
 
+    Ok(dtos)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintInfo {
+    pub path: String,
+    pub kind: String,
+    pub label: String,
+    pub detail: String,
+    pub needs_package_dir: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintApplyRequest {
+    pub blueprint_path: String,
+    pub hosts_text: String,
+    pub username: String,
+    pub password: String,
+    pub concurrency: usize,
+    pub logs_dir: String,
+    pub package_dir: Option<String>,
+    pub verify_bmc_tls: bool,
+    /// Optional override: raid | config-settings | config-batch | firmware-xml
+    pub kind_override: Option<String>,
+    #[serde(default = "default_applytime")]
+    pub applytime: String,
+}
+
+fn default_applytime() -> String {
+    "OnReset".into()
+}
+
+fn parse_kind_override(s: &str) -> Result<BlueprintKind, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "raid" => Ok(BlueprintKind::Raid),
+        "config-settings" | "settings" | "replicate" => Ok(BlueprintKind::ConfigSettings),
+        "config-batch" | "batch" => Ok(BlueprintKind::ConfigBatch),
+        "firmware-xml" | "firmware" | "xml" => Ok(BlueprintKind::FirmwareCompareXml),
+        other => Err(format!("Unknown blueprint kind '{other}'")),
+    }
+}
+
+#[tauri::command]
+pub async fn classify_blueprint(path: String) -> Result<BlueprintInfo, String> {
+    let path = PathBuf::from(path);
+    let info = classify_blueprint_file(&path)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(BlueprintInfo {
+        path: path.display().to_string(),
+        kind: info.kind.as_str().to_string(),
+        label: info.label,
+        detail: info.detail,
+        needs_package_dir: info.needs_package_dir,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_blueprint(
+    app: AppHandle,
+    request: BlueprintApplyRequest,
+) -> Result<Vec<HostResultDto>, String> {
+    let path = PathBuf::from(&request.blueprint_path);
+    if !path.is_file() {
+        return Err(format!("Blueprint file not found: {}", path.display()));
+    }
+
+    let kind = if let Some(over) = &request.kind_override {
+        parse_kind_override(over)?
+    } else {
+        classify_blueprint_file(&path)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .kind
+    };
+
+    let hosts = parse_hosts_text(&request.hosts_text).map_err(|e| e.to_string())?;
+    if hosts.is_empty() {
+        return Err("No host IPs provided".into());
+    }
+    if request.username.trim().is_empty() {
+        return Err("Username is required".into());
+    }
+    if request.password.is_empty() {
+        return Err("Password is required".into());
+    }
+
+    for h in &hosts {
+        let _ = app.emit(
+            "host-progress",
+            HostProgress {
+                ip: h.ip.clone(),
+                serial: None,
+                status: "queued".into(),
+                detail: format!("Waiting to apply {}…", kind.label()),
+            },
+        );
+    }
+
+    let app_progress = app.clone();
+    let on_progress: crate::blueprint::BlueprintProgressCb =
+        std::sync::Arc::new(move |ip, status, serial, detail| {
+            let _ = app_progress.emit(
+                "host-progress",
+                HostProgress {
+                    ip,
+                    serial,
+                    status,
+                    detail,
+                },
+            );
+        });
+
+    let results = apply_blueprint_concurrent(
+        path,
+        kind,
+        hosts,
+        request.username,
+        request.password,
+        request.concurrency.max(1),
+        BlueprintApplyOptions {
+            package_dir: request.package_dir.map(PathBuf::from),
+            logs_dir: PathBuf::from(&request.logs_dir),
+            never_check_trust: !request.verify_bmc_tls,
+            applytime: request.applytime,
+        },
+        Some(on_progress),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+
+    let mut dtos = Vec::new();
+    for r in results {
+        let _ = app.emit(
+            "host-progress",
+            HostProgress {
+                ip: r.ip.clone(),
+                serial: if r.serial.is_empty() {
+                    None
+                } else {
+                    Some(r.serial.clone())
+                },
+                status: r.outcome.clone(),
+                detail: r.detail.clone(),
+            },
+        );
+        dtos.push(HostResultDto {
+            ip: r.ip,
+            serial: r.serial,
+            outcome: r.outcome,
+            detail: r.detail,
+        });
+    }
     Ok(dtos)
 }

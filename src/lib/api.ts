@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export type ModelInfo = {
   index: number;
@@ -30,6 +31,14 @@ export type HostResult = {
   serial: string;
   outcome: string;
   detail: string;
+};
+
+export type BlueprintInfo = {
+  path: string;
+  kind: string;
+  label: string;
+  detail: string;
+  needsPackageDir: boolean;
 };
 
 export async function listModels(): Promise<ModelInfo[]> {
@@ -75,6 +84,48 @@ export async function startUpdates(args: {
   bundleOverrides?: Record<string, string> | null;
 }): Promise<HostResult[]> {
   return invoke("start_updates", { request: args });
+}
+
+export async function classifyBlueprint(path: string): Promise<BlueprintInfo> {
+  return invoke("classify_blueprint", { path });
+}
+
+export async function applyBlueprint(args: {
+  blueprintPath: string;
+  hostsText: string;
+  username: string;
+  password: string;
+  concurrency: number;
+  logsDir: string;
+  packageDir?: string | null;
+  verifyBmcTls: boolean;
+  kindOverride?: string | null;
+  applytime?: string;
+}): Promise<HostResult[]> {
+  return invoke("apply_blueprint", { request: args });
+}
+
+export async function pickBlueprintFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    filters: [
+      {
+        name: "Blueprints",
+        extensions: ["ini", "xml", "txt"],
+      },
+    ],
+  });
+  if (typeof selected === "string") return selected;
+  return null;
+}
+
+export async function pickPackageDirectory(): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+  });
+  if (typeof selected === "string") return selected;
+  return null;
 }
 
 export function onDownloadProgress(

@@ -1,4 +1,4 @@
-//! Per-host firmware update workflow.
+//! Per-host firmware update workflow (OneCLI only).
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -7,9 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use crate::lenovo::onecli_compare;
+use crate::lenovo::{
+    onecli_compare, onecli_flash_bundle, onecli_identify, onecli_power_restart,
+    onecli_wait_bmc_ready,
+};
 use crate::logutil::{log_path_for, HostLogger};
-use crate::redfish::{RedfishClient, StageResult};
 
 /// Target host specification (optional credential override).
 #[derive(Debug, Clone)]
@@ -22,14 +24,16 @@ pub struct TargetHost {
 /// Options for reboot + post-update verification.
 #[derive(Debug, Clone)]
 pub struct UpdateOptions {
-    /// Issue Redfish ComputerSystem.Reset after staging (default true).
+    /// Issue OneCLI power restart after staging (default true).
     pub reboot_after_stage: bool,
     /// Reset type: ForceRestart (default) or GracefulRestart.
     pub reset_type: String,
     /// Run OneCLI compare after reboot to confirm no updates remain (default true).
     pub verify_with_compare: bool,
-    /// How long to wait for the host to come back after reboot.
+    /// How long to wait for the BMC to answer after reboot.
     pub reboot_timeout: Duration,
+    /// Firmware apply time for OneCLI bundle flash (default OnReset).
+    pub applytime: String,
 }
 
 impl Default for UpdateOptions {
@@ -39,6 +43,7 @@ impl Default for UpdateOptions {
             reset_type: "ForceRestart".into(),
             verify_with_compare: true,
             reboot_timeout: Duration::from_secs(90 * 60),
+            applytime: "OnReset".into(),
         }
     }
 }
@@ -118,12 +123,12 @@ fn package_dir_for_bundle(bundle: &Path) -> PathBuf {
     }
 }
 
-/// Run update for one BMC: stage → reboot → verify via OneCLI compare.
+/// Run update for one BMC via OneCLI: identify → flash bundle → reboot → compare.
 pub async fn update_one_host(
     host: &TargetHost,
     default_user: &str,
     default_pass: &str,
-    insecure_tls: bool,
+    never_check_trust: bool,
     bundles_by_mt: &HashMap<String, PathBuf>,
     logs_dir: &Path,
     options: &UpdateOptions,
@@ -153,37 +158,26 @@ pub async fn update_one_host(
             };
         }
     };
-    log.info(&format!("Connecting to {} as {user}", host.ip));
-    notify("running", None, "Connecting to BMC…");
+    log.info(&format!("Connecting to {} as {user} via OneCLI", host.ip));
+    notify("running", None, "OneCLI inventory — identifying host…");
 
-    let client = match RedfishClient::new(&host.ip, user, pass, insecure_tls) {
-        Ok(c) => c,
-        Err(e) => {
-            log.error(&format!("client build failed: {e:#}"));
-            return HostOutcome::Failed {
-                serial: format!("unknown-{}", host.ip),
-                reason: e.to_string(),
-            };
-        }
-    };
-
-    let identity = match client.identify(&log).await {
+    let identify_dir = logs_dir.join("identify").join(
+        crate::logutil::sanitize_serial(&host.ip),
+    );
+    let identity = match onecli_identify(user, pass, &host.ip, &identify_dir, never_check_trust)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             log.error(&format!("identify failed: {e:#}"));
             return HostOutcome::Failed {
                 serial: format!("unknown-{}", host.ip),
-                reason: format!("identify: {e:#}"),
+                reason: format!("OneCLI identify: {e:#}"),
             };
         }
     };
 
-    let serial = if identity.serial.is_empty() {
-        format!("unknown-{}", host.ip)
-    } else {
-        identity.serial.clone()
-    };
-
+    let serial = identity.serial.clone();
     let final_path = log_path_for(logs_dir, Some(&serial), &host.ip);
     let log = if final_path != provisional {
         match HostLogger::create(final_path) {
@@ -198,10 +192,11 @@ pub async fn update_one_host(
     };
 
     let Some(mt) = identity.machine_type.clone() else {
-        let reason = "could not determine machine type from Redfish identity".to_string();
+        let reason = "could not determine machine type from OneCLI inventory".to_string();
         log.error(&reason);
         return HostOutcome::Failed { serial, reason };
     };
+    log.info(&format!("Identity serial={serial} mt={mt}"));
 
     let Some(bundle) = bundles_by_mt.get(&mt) else {
         let reason = format!(
@@ -212,23 +207,28 @@ pub async fn update_one_host(
     };
 
     log.info(&format!("Using bundle {}", bundle.display()));
-    if let Err(e) = client.log_inventory(&log).await {
-        log.warn(&format!("inventory snapshot failed: {e:#}"));
-    }
+    let package_dir = package_dir_for_bundle(bundle);
 
-    notify("staging", Some(&serial), "Uploading Update Bundle (OnReset)…");
-    let stage = match client.stage_bundle_onreset(bundle, &log).await {
-        Ok(StageResult::Staged { task_state, job_uri }) => {
-            let detail = match &job_uri {
-                Some(j) => format!("TaskState={task_state}; job={j}"),
-                None => format!("TaskState={task_state}"),
-            };
-            log.info(&format!("STAGED (OnReset): {detail}"));
-            (task_state, job_uri, detail)
-        }
-        Ok(StageResult::Failed { reason }) => {
-            log.error(&format!("FAILED: {reason}"));
-            return HostOutcome::Failed { serial, reason };
+    notify(
+        "staging",
+        Some(&serial),
+        "OneCLI update flash --bundle (OnReset)…",
+    );
+    let flash_dir = logs_dir.join("flash").join(&serial);
+    let stage_detail = match onecli_flash_bundle(
+        user,
+        pass,
+        &host.ip,
+        &package_dir,
+        &flash_dir,
+        &options.applytime,
+        never_check_trust,
+    )
+    .await
+    {
+        Ok(detail) => {
+            log.info(&detail);
+            detail
         }
         Err(e) => {
             log.error(&format!("FAILED: {e:#}"));
@@ -238,7 +238,6 @@ pub async fn update_one_host(
             };
         }
     };
-    let (_task_state, job_uri, stage_detail) = stage;
 
     if !options.reboot_after_stage {
         log.info("Reboot disabled — leaving firmware staged for OnReset");
@@ -251,9 +250,19 @@ pub async fn update_one_host(
     notify(
         "rebooting",
         Some(&serial),
-        &format!("Issuing {}…", options.reset_type),
+        &format!("OneCLI misc power ({})…", options.reset_type),
     );
-    if let Err(e) = client.reset_host(&options.reset_type, &log).await {
+    let power_dir = logs_dir.join("power").join(&serial);
+    if let Err(e) = onecli_power_restart(
+        user,
+        pass,
+        &host.ip,
+        &options.reset_type,
+        &power_dir,
+        never_check_trust,
+    )
+    .await
+    {
         log.error(&format!("reset failed: {e:#}"));
         return HostOutcome::Failed {
             serial,
@@ -261,38 +270,20 @@ pub async fn update_one_host(
         };
     }
 
-    let _ = client
-        .wait_until_unreachable(&log, Duration::from_secs(5 * 60))
-        .await;
-
     notify(
         "applying",
         Some(&serial),
-        "Waiting for host to return after firmware apply…",
+        "Waiting for BMC to return after firmware apply…",
     );
-    if let Err(e) = client
-        .wait_until_ready(&log, options.reboot_timeout)
-        .await
+    if let Err(e) =
+        onecli_wait_bmc_ready(user, pass, &host.ip, options.reboot_timeout, never_check_trust)
+            .await
     {
         log.error(&format!("host did not return: {e:#}"));
         return HostOutcome::Failed {
             serial,
             reason: format!("reboot/apply wait failed: {e:#}"),
         };
-    }
-
-    if let Some(ref job) = job_uri {
-        notify("applying", Some(&serial), "Waiting for update job to finish…");
-        match client
-            .wait_for_job(job, &log, Duration::from_secs(60 * 60))
-            .await
-        {
-            Ok(()) => log.info("Update job completed"),
-            Err(e) => {
-                // Job may have been cleaned up after reboot; continue to compare.
-                log.warn(&format!("job monitor: {e:#} (continuing to verify)"));
-            }
-        }
     }
 
     if !options.verify_with_compare {
@@ -306,9 +297,17 @@ pub async fn update_one_host(
         Some(&serial),
         "OneCLI compare — checking for remaining updates…",
     );
-    let package_dir = package_dir_for_bundle(bundle);
     let compare_out = logs_dir.join("compare").join(&serial);
-    match onecli_compare(user, pass, &host.ip, &package_dir, &compare_out).await {
+    match onecli_compare(
+        user,
+        pass,
+        &host.ip,
+        &package_dir,
+        &compare_out,
+        never_check_trust,
+    )
+    .await
+    {
         Ok(cmp) => {
             log.info(&cmp.summary);
             log.info(&format!("compare output: {}", cmp.output_dir.display()));
@@ -344,7 +343,7 @@ pub async fn run_concurrent(
     hosts: Vec<TargetHost>,
     default_user: String,
     default_pass: String,
-    insecure_tls: bool,
+    never_check_trust: bool,
     bundles_by_mt: HashMap<String, PathBuf>,
     logs_dir: PathBuf,
     concurrency: usize,
@@ -385,7 +384,7 @@ pub async fn run_concurrent(
                 &host,
                 &default_user,
                 &default_pass,
-                insecure_tls,
+                never_check_trust,
                 &bundles,
                 &logs_dir,
                 &options,

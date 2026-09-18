@@ -1,10 +1,10 @@
-//! OneRust Tauri library — Redfish firmware updater backend.
+//! OneRust Tauri library — OneCLI firmware updater backend.
 
+mod blueprint;
 mod catalog;
 mod commands;
 mod lenovo;
 mod logutil;
-mod redfish;
 mod update;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -20,6 +20,8 @@ pub fn run() {
             commands::start_updates,
             commands::parse_hosts,
             commands::default_paths,
+            commands::classify_blueprint,
+            commands::apply_blueprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running OneRust");

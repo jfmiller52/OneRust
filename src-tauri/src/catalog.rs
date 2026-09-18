@@ -105,7 +105,7 @@ pub fn normalize_machine_type(raw: &str) -> String {
         .collect()
 }
 
-/// Extract a 4-char machine type from Redfish identity fields.
+/// Extract a 4-char machine type from inventory / identity text fields.
 pub fn extract_machine_type(sku: Option<&str>, model: Option<&str>, hostname: Option<&str>) -> Option<String> {
     if let Some(sku) = sku {
         let mt = normalize_machine_type(sku);

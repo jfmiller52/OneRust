@@ -318,7 +318,6 @@ fn is_bundle_name(path: &Path) -> bool {
 
 /// Acquire latest bundle for `mt` via local OneCLI, or return a local ZIP in offline mode.
 pub async fn acquire_bundle_for_mt(
-    _client: &Client,
     mt: &str,
     firmware_root: &Path,
     offline_only: bool,
@@ -357,6 +356,7 @@ pub async fn onecli_compare(
     bmc_ip: &str,
     package_dir: &Path,
     output_dir: &Path,
+    never_check_trust: bool,
 ) -> Result<CompareOutcome> {
     let onecli = ensure_onecli().await?;
     fs::create_dir_all(output_dir)
@@ -364,26 +364,30 @@ pub async fn onecli_compare(
         .with_context(|| format!("create {}", output_dir.display()))?;
 
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
-    let output = Command::new(&onecli)
-        .args([
-            "update",
-            "compare",
-            "--bmc",
-            &bmc,
-            "--dir",
-            &package_dir.to_string_lossy(),
-            "--type",
-            "fw",
-            "--scope",
-            "latest",
-            "--ostype",
-            "none",
-            "--output",
-            &output_dir.to_string_lossy(),
-            "--quiet",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = Command::new(&onecli);
+    cmd.args([
+        "update",
+        "compare",
+        "--bmc",
+        &bmc,
+        "--dir",
+        &package_dir.to_string_lossy(),
+        "--type",
+        "fw",
+        "--scope",
+        "latest",
+        "--ostype",
+        "none",
+        "--output",
+        &output_dir.to_string_lossy(),
+        "--quiet",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if never_check_trust {
+        cmd.arg("--never-check-trust");
+    }
+    let output = cmd
         .output()
         .await
         .with_context(|| format!("spawn {}", onecli.display()))?;
@@ -423,6 +427,418 @@ pub async fn onecli_compare(
         summary,
         output_dir: output_dir.to_path_buf(),
     })
+}
+
+/// Host identity from OneCLI inventory.
+#[derive(Debug, Clone)]
+pub struct OnecliIdentity {
+    pub serial: String,
+    pub machine_type: Option<String>,
+}
+
+/// Resolve serial + machine type via `inventory getinfor --device system_overview`.
+pub async fn onecli_identify(
+    bmc_user: &str,
+    bmc_pass: &str,
+    bmc_ip: &str,
+    output_dir: &Path,
+    never_check_trust: bool,
+) -> Result<OnecliIdentity> {
+    let onecli = ensure_onecli().await?;
+    fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create {}", output_dir.display()))?;
+
+    let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
+    let mut cmd = Command::new(&onecli);
+    cmd.args([
+        "inventory",
+        "getinfor",
+        "--bmc",
+        &bmc,
+        "--device",
+        "system_overview",
+        "--quiet",
+        "--output",
+        &output_dir.to_string_lossy(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if never_check_trust {
+        cmd.arg("--never-check-trust");
+    }
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("spawn {}", onecli.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let _ = fs::write(output_dir.join("getinfor-stdout.txt"), &stdout).await;
+    let _ = fs::write(output_dir.join("getinfor-stderr.txt"), &stderr).await;
+
+    let mut blob = format!("{stdout}\n{stderr}\n");
+    blob.push_str(&collect_text_files(output_dir).await.unwrap_or_default());
+
+    if !output.status.success()
+        && extract_serial_from_inventory(&blob).is_none()
+        && extract_machine_type_from_inventory(&blob).is_none()
+    {
+        bail!(
+            "OneCLI inventory getinfor failed (exit {:?}): {}",
+            output.status.code(),
+            truncate(&blob, 800)
+        );
+    }
+
+    let serial = extract_serial_from_inventory(&blob)
+        .map(|s| crate::logutil::sanitize_serial(&s))
+        .unwrap_or_else(|| {
+            format!(
+                "unknown-{}",
+                crate::logutil::sanitize_serial(bmc_ip)
+            )
+        });
+    let machine_type = extract_machine_type_from_inventory(&blob);
+
+    Ok(OnecliIdentity {
+        serial,
+        machine_type,
+    })
+}
+
+/// Stage/flash a firmware bundle with OnReset apply time (no automatic reboot).
+pub async fn onecli_flash_bundle(
+    bmc_user: &str,
+    bmc_pass: &str,
+    bmc_ip: &str,
+    package_dir: &Path,
+    output_dir: &Path,
+    applytime: &str,
+    never_check_trust: bool,
+) -> Result<String> {
+    let onecli = ensure_onecli().await?;
+    fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create {}", output_dir.display()))?;
+
+    let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
+    let mut cmd = Command::new(&onecli);
+    cmd.args([
+        "update",
+        "flash",
+        "--bmc",
+        &bmc,
+        "--dir",
+        &package_dir.to_string_lossy(),
+        "--bundle",
+        "--applytime",
+        applytime,
+        "--noreboot",
+        "--quiet",
+        "--output",
+        &output_dir.to_string_lossy(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if never_check_trust {
+        cmd.arg("--never-check-trust");
+    }
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("spawn {}", onecli.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}\n{stderr}");
+    let _ = fs::write(output_dir.join("flash-stdout.txt"), &stdout).await;
+    let _ = fs::write(output_dir.join("flash-stderr.txt"), &stderr).await;
+
+    if !output.status.success() {
+        bail!(
+            "OneCLI update flash failed (exit {:?}): {}",
+            output.status.code(),
+            truncate(&combined, 900)
+        );
+    }
+
+    Ok(format!(
+        "OneCLI flash --bundle --applytime {applytime} --noreboot OK"
+    ))
+}
+
+/// Force- or graceful-restart a host via OneCLI power commands.
+pub async fn onecli_power_restart(
+    bmc_user: &str,
+    bmc_pass: &str,
+    bmc_ip: &str,
+    reset_type: &str,
+    output_dir: &Path,
+    never_check_trust: bool,
+) -> Result<()> {
+    let onecli = ensure_onecli().await?;
+    fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| format!("create {}", output_dir.display()))?;
+
+    let action = if reset_type.eq_ignore_ascii_case("GracefulRestart")
+        || reset_type.eq_ignore_ascii_case("normalrestart")
+    {
+        "normalrestart"
+    } else {
+        "forcerestart"
+    };
+
+    let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
+    let mut cmd = Command::new(&onecli);
+    cmd.args([
+        "misc",
+        "power",
+        action,
+        "--bmc",
+        &bmc,
+        "--quiet",
+        "--output",
+        &output_dir.to_string_lossy(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if never_check_trust {
+        cmd.arg("--never-check-trust");
+    }
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("spawn {}", onecli.display()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let _ = fs::write(output_dir.join(format!("{action}-stdout.txt")), &stdout).await;
+    let _ = fs::write(output_dir.join(format!("{action}-stderr.txt")), &stderr).await;
+
+    if !output.status.success() {
+        bail!(
+            "OneCLI misc power {action} failed (exit {:?}): {}",
+            output.status.code(),
+            truncate(&format!("{stdout}\n{stderr}"), 800)
+        );
+    }
+    Ok(())
+}
+
+/// Poll `misc power state` until the BMC answers successfully (host/BMC back after reboot).
+pub async fn onecli_wait_bmc_ready(
+    bmc_user: &str,
+    bmc_pass: &str,
+    bmc_ip: &str,
+    timeout: Duration,
+    never_check_trust: bool,
+) -> Result<()> {
+    let onecli = ensure_onecli().await?;
+    let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
+    let start = std::time::Instant::now();
+    let mut saw_down = false;
+
+    // Give the host a moment to drop after restart.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    loop {
+        if start.elapsed() > timeout {
+            bail!(
+                "timed out waiting for BMC {bmc_ip} after {}s",
+                timeout.as_secs()
+            );
+        }
+
+        let mut cmd = Command::new(&onecli);
+        cmd.args(["misc", "power", "state", "--bmc", &bmc, "--quiet"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if never_check_trust {
+            cmd.arg("--never-check-trust");
+        }
+
+        match cmd.output().await {
+            Ok(output) if output.status.success() => {
+                let text =
+                    format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                    .to_ascii_lowercase();
+                // Prefer returning once power state reports On after we observed a gap,
+                // but accept first success if the BMC never fully dropped.
+                if text.contains("power off") || (text.contains("off") && !text.contains("on")) {
+                    saw_down = true;
+                } else if text.contains("on") || text.contains("power") || !saw_down {
+                    return Ok(());
+                }
+            }
+            _ => {
+                saw_down = true;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+async fn collect_text_files(dir: &Path) -> Result<String> {
+    let mut out = String::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries = fs::read_dir(&current).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name.ends_with(".xml")
+                || name.ends_with(".txt")
+                || name.ends_with(".html")
+                || name.ends_with(".log")
+            {
+                if let Ok(text) = fs::read_to_string(&path).await {
+                    out.push_str(&text);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Pull a serial number out of OneCLI inventory text/XML.
+pub fn extract_serial_from_inventory(text: &str) -> Option<String> {
+    const TAGS: &[&str] = &[
+        "SerialNumber",
+        "serial_number",
+        "MachineSerialNumber",
+        "ProductSerialNumber",
+        "Serial",
+    ];
+    for tag in TAGS {
+        if let Some(v) = xml_tag_value(text, tag) {
+            if looks_like_serial(&v) {
+                return Some(v);
+            }
+        }
+    }
+
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("serialnumber")
+            || lower.contains("serial_number")
+            || lower.contains("serial number"))
+        {
+            continue;
+        }
+        if let Some(v) = value_after_sep(line) {
+            if looks_like_serial(&v) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Pull a 4-char machine type from OneCLI inventory text/XML.
+pub fn extract_machine_type_from_inventory(text: &str) -> Option<String> {
+    const TAGS: &[&str] = &[
+        "MachineType",
+        "machine_type",
+        "MT",
+        "ProductId",
+        "ProductID",
+        "MachType",
+    ];
+    for tag in TAGS {
+        if let Some(v) = xml_tag_value(text, tag) {
+            let mt = crate::catalog::normalize_machine_type(&v);
+            if mt.len() == 4 {
+                return Some(mt);
+            }
+        }
+    }
+
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("machinetype")
+            || lower.contains("machine_type")
+            || lower.contains("machine type")
+            || lower.contains("productid")
+            || lower.contains("machtype"))
+        {
+            continue;
+        }
+        if let Some(v) = value_after_sep(line) {
+            let mt = crate::catalog::normalize_machine_type(&v);
+            if mt.len() == 4 {
+                return Some(mt);
+            }
+        }
+    }
+
+    // Fall back to catalog heuristics against model/hostname-like strings.
+    crate::catalog::extract_machine_type(None, Some(text), Some(text))
+}
+
+fn xml_tag_value(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let lower = text.to_ascii_lowercase();
+    let open_l = open.to_ascii_lowercase();
+    let close_l = close.to_ascii_lowercase();
+    let start = lower.find(&open_l)?;
+    let after_open = start + open_l.len();
+    let gt = text[after_open..].find('>')? + after_open + 1;
+    let end_rel = lower[gt..].find(&close_l)?;
+    let value = text[gt..gt + end_rel].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn value_after_sep(line: &str) -> Option<String> {
+    for sep in [">", "=", ":", "\t"] {
+        if let Some((_, rest)) = line.split_once(sep) {
+            let cleaned = rest
+                .trim()
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == '<' || c == '/')
+                .trim();
+            let cleaned = cleaned.split('<').next().unwrap_or(cleaned).trim();
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_serial(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "n/a" | "na" | "none" | "null" | "unknown" | "not available"
+    ) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 async fn dir_has_xml(dir: &Path) -> Result<bool> {
@@ -602,5 +1018,38 @@ mod tests {
             </Packages>
         "#;
         assert_eq!(count_update_packages_in_xml(xml), 1);
+    }
+
+    #[test]
+    fn extracts_serial_from_xml_tag() {
+        let xml = r#"
+            <System>
+              <MachineType>7D75</MachineType>
+              <SerialNumber>J123ABC</SerialNumber>
+            </System>
+        "#;
+        assert_eq!(
+            extract_serial_from_inventory(xml).as_deref(),
+            Some("J123ABC")
+        );
+        assert_eq!(
+            extract_machine_type_from_inventory(xml).as_deref(),
+            Some("7D75")
+        );
+    }
+
+    #[test]
+    fn extracts_serial_from_key_value() {
+        let text = "Serial Number: K987XYZ\nHostname: node1\n";
+        assert_eq!(
+            extract_serial_from_inventory(text).as_deref(),
+            Some("K987XYZ")
+        );
+    }
+
+    #[test]
+    fn ignores_placeholder_serial() {
+        let xml = "<SerialNumber>N/A</SerialNumber>";
+        assert!(extract_serial_from_inventory(xml).is_none());
     }
 }

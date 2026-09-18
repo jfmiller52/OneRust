@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Cpu, Download, Play, Server, Shield } from "lucide-react";
+import {
+  Cpu,
+  Download,
+  FileCode2,
+  FolderOpen,
+  Play,
+  Server,
+  Shield,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -10,14 +18,19 @@ import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  applyBlueprint,
+  classifyBlueprint,
   downloadBundles,
   ensureOnecliReady,
   listModels,
   onDownloadProgress,
   onHostProgress,
   parseHosts,
+  pickBlueprintFile,
+  pickPackageDirectory,
   resolveMachineTypes,
   startUpdates,
+  type BlueprintInfo,
   type DownloadProgress,
   type HostProgress,
   type HostResult,
@@ -25,6 +38,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
+type Mode = "firmware" | "blueprint";
 type Step = "models" | "firmware" | "targets" | "run";
 
 const STEPS: { id: Step; label: string; icon: typeof Cpu }[] = [
@@ -39,6 +53,7 @@ function statusColor(status: string) {
     case "ready":
     case "staged":
     case "verified":
+    case "applied":
       return "text-ok";
     case "failed":
     case "error":
@@ -60,6 +75,7 @@ function statusColor(status: string) {
 }
 
 export default function App() {
+  const [mode, setMode] = useState<Mode>("firmware");
   const [step, setStep] = useState<Step>("models");
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -82,6 +98,16 @@ export default function App() {
   const [results, setResults] = useState<HostResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [onecliStatus, setOnecliStatus] = useState<string>("checking");
+
+  // Blueprint mode
+  const [blueprintPath, setBlueprintPath] = useState("");
+  const [blueprintInfo, setBlueprintInfo] = useState<BlueprintInfo | null>(null);
+  const [packageDir, setPackageDir] = useState("firmware");
+  const [blueprintRunning, setBlueprintRunning] = useState(false);
+  const [blueprintResults, setBlueprintResults] = useState<HostResult[]>([]);
+  const [blueprintProgress, setBlueprintProgress] = useState<
+    Record<string, HostProgress>
+  >({});
 
   useEffect(() => {
     listModels()
@@ -120,12 +146,16 @@ export default function App() {
       }
     }).then((u) => unsubs.push(u));
     onHostProgress((p) => {
-      setHostProgress((prev) => ({ ...prev, [p.ip]: p }));
+      if (mode === "blueprint") {
+        setBlueprintProgress((prev) => ({ ...prev, [p.ip]: p }));
+      } else {
+        setHostProgress((prev) => ({ ...prev, [p.ip]: p }));
+      }
     }).then((u) => unsubs.push(u));
     return () => {
       unsubs.forEach((u) => u());
     };
-  }, []);
+  }, [mode]);
 
   const toggleModel = (index: number) => {
     setSelected((prev) => {
@@ -238,6 +268,69 @@ export default function App() {
     }
   };
 
+  const chooseBlueprint = async () => {
+    setError(null);
+    try {
+      const path = await pickBlueprintFile();
+      if (!path) return;
+      setBlueprintPath(path);
+      const info = await classifyBlueprint(path);
+      setBlueprintInfo(info);
+    } catch (e) {
+      setBlueprintInfo(null);
+      setError(String(e));
+    }
+  };
+
+  const choosePackageDir = async () => {
+    try {
+      const path = await pickPackageDirectory();
+      if (path) setPackageDir(path);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const runBlueprint = async () => {
+    setError(null);
+    if (!blueprintPath) {
+      setError("Choose a blueprint file (.ini / .xml / .txt).");
+      return;
+    }
+    const n = await validateHosts();
+    if (!n) return;
+    if (!password) {
+      setError("XCC password is required.");
+      return;
+    }
+    if (blueprintInfo?.needsPackageDir && !packageDir.trim()) {
+      setError("Firmware XML blueprints need a package directory.");
+      return;
+    }
+
+    setBlueprintRunning(true);
+    setBlueprintResults([]);
+    setBlueprintProgress({});
+    try {
+      await ensureOnecliReady();
+      const res = await applyBlueprint({
+        blueprintPath,
+        hostsText,
+        username,
+        password,
+        concurrency,
+        logsDir,
+        packageDir: blueprintInfo?.needsPackageDir ? packageDir : null,
+        verifyBmcTls: verifyTls,
+      });
+      setBlueprintResults(res);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBlueprintRunning(false);
+    }
+  };
+
   const summary = useMemo(() => {
     const verified = results.filter((r) => r.outcome === "verified").length;
     const staged = results.filter((r) => r.outcome === "staged").length;
@@ -245,6 +338,12 @@ export default function App() {
     const skipped = results.filter((r) => r.outcome === "skipped").length;
     return { verified, staged, failed, skipped };
   }, [results]);
+
+  const blueprintSummary = useMemo(() => {
+    const applied = blueprintResults.filter((r) => r.outcome === "applied").length;
+    const failed = blueprintResults.filter((r) => r.outcome === "failed").length;
+    return { applied, failed };
+  }, [blueprintResults]);
 
   const downloadPct =
     machineTypes.length === 0
@@ -263,44 +362,82 @@ export default function App() {
             OneRust
           </h1>
           <span className="font-mono text-xs text-rack-400">
-            ThinkSystem V3/V4 · Redfish · reboot + verify
+            ThinkSystem V3/V4 · OneCLI · reboot + verify
           </span>
         </div>
         <div className="flex items-center gap-2 text-xs text-rack-400">
           <Shield className="size-3.5 text-signal" />
-          Stage → reboot → OneCLI compare
+          {mode === "firmware"
+            ? "Flash → reboot → OneCLI compare"
+            : "OneCLI blueprint apply"}
         </div>
       </header>
 
-      <nav className="flex gap-1 border-b border-border px-6 py-3">
-        {STEPS.map((s, i) => {
-          const Icon = s.icon;
-          const active = step === s.id;
-          const idx = STEPS.findIndex((x) => x.id === step);
-          const done = i < idx;
-          return (
-            <button
-              key={s.id}
-              type="button"
-              onClick={() => {
-                if (done || active) setStep(s.id);
-              }}
-              className={cn(
-                "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
-                active && "bg-rack-800 text-rack-100",
-                !active && done && "text-rack-300 hover:bg-rack-850",
-                !active && !done && "text-rack-600 cursor-default"
-              )}
-            >
-              <Icon className="size-4" />
-              <span className="font-mono text-[10px] text-rack-500">
-                {String(i + 1).padStart(2, "0")}
-              </span>
-              {s.label}
-            </button>
-          );
-        })}
-      </nav>
+      <div className="flex gap-1 border-b border-border px-6 py-2">
+        <button
+          type="button"
+          onClick={() => {
+            setMode("firmware");
+            setError(null);
+          }}
+          className={cn(
+            "rounded-md px-3 py-1.5 text-sm transition-colors",
+            mode === "firmware"
+              ? "bg-rack-800 text-rack-100"
+              : "text-rack-400 hover:bg-rack-850 hover:text-rack-200"
+          )}
+        >
+          Firmware update
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setMode("blueprint");
+            setError(null);
+          }}
+          className={cn(
+            "flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors",
+            mode === "blueprint"
+              ? "bg-rack-800 text-rack-100"
+              : "text-rack-400 hover:bg-rack-850 hover:text-rack-200"
+          )}
+        >
+          <FileCode2 className="size-3.5" />
+          Blueprint
+        </button>
+      </div>
+
+      {mode === "firmware" && (
+        <nav className="flex gap-1 border-b border-border px-6 py-3">
+          {STEPS.map((s, i) => {
+            const Icon = s.icon;
+            const active = step === s.id;
+            const idx = STEPS.findIndex((x) => x.id === step);
+            const done = i < idx;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => {
+                  if (done || active) setStep(s.id);
+                }}
+                className={cn(
+                  "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
+                  active && "bg-rack-800 text-rack-100",
+                  !active && done && "text-rack-300 hover:bg-rack-850",
+                  !active && !done && "text-rack-600 cursor-default"
+                )}
+              >
+                <Icon className="size-4" />
+                <span className="font-mono text-[10px] text-rack-500">
+                  {String(i + 1).padStart(2, "0")}
+                </span>
+                {s.label}
+              </button>
+            );
+          })}
+        </nav>
+      )}
 
       <main className="flex-1 overflow-hidden px-6 py-5">
         {error && (
@@ -309,7 +446,198 @@ export default function App() {
           </div>
         )}
 
-        {step === "models" && (
+        {mode === "blueprint" && (
+          <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
+            <div>
+              <h2 className="text-lg font-medium">Apply blueprint</h2>
+              <p className="mt-1 text-sm text-rack-400">
+                Choose an{" "}
+                <span className="font-mono text-rack-300">.ini</span> RAID
+                policy, a settings{" "}
+                <span className="font-mono text-rack-300">.txt</span> /{" "}
+                <span className="font-mono text-rack-300">.ini</span> from OneCLI{" "}
+                <span className="font-mono">config save</span>, a{" "}
+                <span className="font-mono">config batch</span> file, or a
+                firmware compare{" "}
+                <span className="font-mono text-rack-300">.xml</span>. OneRust
+                detects the type and applies it to each BMC via OneCLI.
+              </p>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+              <div className="space-y-2">
+                <Label>Blueprint file</Label>
+                <Input
+                  readOnly
+                  value={blueprintPath}
+                  placeholder="Select .ini / .xml / .txt…"
+                  className="font-mono"
+                />
+              </div>
+              <Button variant="outline" onClick={chooseBlueprint}>
+                <FolderOpen className="size-4" />
+                Browse
+              </Button>
+            </div>
+
+            {blueprintInfo && (
+              <div className="rounded-md border border-border bg-rack-850/60 px-3 py-2 text-sm">
+                <span className="text-rack-100">{blueprintInfo.label}</span>
+                <span className="mx-2 text-rack-600">·</span>
+                <span className="font-mono text-xs text-rack-400">
+                  {blueprintInfo.kind}
+                </span>
+                <span className="mx-2 text-rack-600">·</span>
+                <span className="text-rack-400">{blueprintInfo.detail}</span>
+              </div>
+            )}
+
+            {blueprintInfo?.needsPackageDir && (
+              <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+                <div className="space-y-2">
+                  <Label htmlFor="pkgdir">Firmware package directory</Label>
+                  <Input
+                    id="pkgdir"
+                    value={packageDir}
+                    onChange={(e) => setPackageDir(e.target.value)}
+                    className="font-mono"
+                  />
+                  <p className="text-xs text-rack-400">
+                    Directory passed to OneCLI{" "}
+                    <span className="font-mono">update flash --dir</span> with{" "}
+                    <span className="font-mono">--comparexml</span>.
+                  </p>
+                </div>
+                <Button variant="outline" onClick={choosePackageDir}>
+                  <FolderOpen className="size-4" />
+                  Browse
+                </Button>
+              </div>
+            )}
+
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="space-y-2">
+                <Label htmlFor="bp-user">Username</Label>
+                <Input
+                  id="bp-user"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bp-pass">Password</Label>
+                <Input
+                  id="bp-pass"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="bp-conc">Concurrency</Label>
+                <Input
+                  id="bp-conc"
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={concurrency}
+                  onChange={(e) =>
+                    setConcurrency(Math.max(1, Number(e.target.value) || 1))
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="bp-tls"
+                  checked={verifyTls}
+                  onCheckedChange={setVerifyTls}
+                />
+                <Label htmlFor="bp-tls">Verify BMC TLS certificates</Label>
+              </div>
+              <div className="space-y-0">
+                <Label htmlFor="bp-logs" className="sr-only">
+                  Logs directory
+                </Label>
+                <Input
+                  id="bp-logs"
+                  value={logsDir}
+                  onChange={(e) => setLogsDir(e.target.value)}
+                  className="h-8 w-40 font-mono text-xs"
+                  title="Logs directory"
+                />
+              </div>
+            </div>
+
+            <div className="flex min-h-0 flex-1 flex-col gap-2">
+              <Label htmlFor="bp-hosts">BMC IP addresses</Label>
+              <Textarea
+                id="bp-hosts"
+                placeholder={"10.0.0.11\n10.0.0.12\nadmin:secret@10.0.0.13"}
+                value={hostsText}
+                onChange={(e) => setHostsText(e.target.value)}
+                className="min-h-[120px] flex-1"
+              />
+              <p className="text-xs text-rack-400">
+                {hostCount > 0
+                  ? `${hostCount} host(s) parsed`
+                  : "Paste IPs, one per line or comma-separated"}
+              </p>
+            </div>
+
+            <div className="flex justify-end">
+              <Button onClick={runBlueprint} disabled={blueprintRunning}>
+                {blueprintRunning ? "Applying…" : "Apply blueprint"}
+              </Button>
+            </div>
+
+            <Separator />
+
+            <ScrollArea className="min-h-0 flex-1 rounded-md border border-border bg-rack-850/60 p-3">
+              <ul className="space-y-2 text-sm">
+                {Object.values(blueprintProgress).length === 0 &&
+                  blueprintResults.length === 0 && (
+                    <li className="text-rack-400">
+                      Per-host progress appears here after you apply.
+                    </li>
+                  )}
+                {(blueprintResults.length
+                  ? blueprintResults.map((r) => ({
+                      ip: r.ip,
+                      serial: r.serial,
+                      status: r.outcome,
+                      detail: r.detail,
+                    }))
+                  : Object.values(blueprintProgress)
+                ).map((row) => (
+                  <li
+                    key={row.ip}
+                    className="grid grid-cols-[140px_100px_1fr] gap-2 border-b border-border/40 py-2 font-mono text-xs"
+                  >
+                    <span className="text-rack-100">{row.ip}</span>
+                    <span className={statusColor(row.status)}>{row.status}</span>
+                    <span className="truncate text-rack-400">
+                      {("serial" in row && row.serial
+                        ? `${row.serial} · `
+                        : "") + row.detail}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </ScrollArea>
+
+            {blueprintResults.length > 0 && (
+              <div className="flex flex-wrap gap-6 font-mono text-sm">
+                <span className="text-ok">applied {blueprintSummary.applied}</span>
+                <span className="text-bad">failed {blueprintSummary.failed}</span>
+              </div>
+            )}
+          </section>
+        )}
+
+        {mode === "firmware" && step === "models" && (
           <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
             <div>
               <h2 className="text-lg font-medium">Select models to update</h2>
@@ -366,7 +694,7 @@ export default function App() {
           </section>
         )}
 
-        {step === "firmware" && (
+        {mode === "firmware" && step === "firmware" && (
           <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
@@ -465,7 +793,7 @@ export default function App() {
           </section>
         )}
 
-        {step === "targets" && (
+        {mode === "firmware" && step === "targets" && (
           <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
             <div>
               <h2 className="text-lg font-medium">BMC credentials & hosts</h2>
@@ -542,15 +870,15 @@ export default function App() {
           </section>
         )}
 
-        {step === "run" && (
+        {mode === "firmware" && step === "run" && (
           <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
                 <h2 className="text-lg font-medium">Update, reboot &amp; verify</h2>
                 <p className="mt-1 text-sm text-rack-400">
-                  Stages the Update Bundle (OnReset), force-restarts each host,
-                  then runs OneCLI compare until no further firmware updates are
-                  recommended. Logs:{" "}
+                  Stages the Update Bundle via OneCLI (`--bundle` / OnReset),
+                  force-restarts each host, then runs OneCLI compare until no
+                  further firmware updates are recommended. Logs:{" "}
                   <span className="font-mono text-rack-300">{logsDir}/</span>
                 </p>
               </div>
