@@ -1,23 +1,38 @@
 # OneRust
 
-Desktop app to mass-update **Lenovo ThinkSystem V3/V4** firmware using **Lenovo XClarity Essentials OneCLI** (out-of-band against XCC).
+Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — powered entirely by **Lenovo XClarity Essentials OneCLI**.
 
-It acquires firmware-only Update Bundles with a local **OneCLI** install, flashes them with `--bundle --applytime OnReset`, force-restarts each host via OneCLI power commands, then verifies completion with **OneCLI `update compare`** (success when no further firmware updates are recommended).
+OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply RAID / UEFI / BMC “blueprints” without hand-running CLI scripts per host.
 
-Built with **Tauri 2**, **React**, and **shadcn-style** UI components.
+**Current release:** [v0.2.0](https://github.com/jfmiller52/OneRust/releases/tag/v0.2.0)
+
+## What it does
+
+| Mode | Purpose |
+|------|---------|
+| **Firmware update** | Acquire Update Bundles, flash them out-of-band (`--bundle` / `OnReset`), reboot, then verify with OneCLI compare |
+| **Blueprint** | Apply a local `.ini` / `.xml` / `.txt` blueprint (RAID policy, config settings, batch `set` commands, or compare XML) to many BMCs |
+
+All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 
 ## Prerequisites
 
-- Windows (OneCLI path and PowerShell helpers are Windows-oriented)
-- [Node.js](https://nodejs.org/) 20+
-- [Rust](https://rustup.rs/) (stable) with MSVC toolchain
-- Network access from this PC to:
-  - Target BMC/XCC management IPs
-  - Lenovo download/support sites (`download.lenovo.com`, `support.lenovo.com`)
+- **Windows** (OneCLI packaging and helpers are Windows-oriented)
+- Network reachability to target XCC/BMC IPs
+- For development: [Node.js](https://nodejs.org/) 20+, [Rust](https://rustup.rs/) (stable, MSVC)
 
-On **first run**, if `OneCLI/OneCli.exe` is not already next to the executable, OneRust downloads Lenovo OneCLI and extracts it into an `OneCLI/` folder beside the app.
+On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable, OneRust downloads Lenovo OneCLI and extracts it into `OneCLI/` next to the app.
 
-## Quick start
+## Install (release)
+
+Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
+
+- `OneRust_*_x64-setup.exe` (NSIS), or
+- `OneRust_*_x64_en-US.msi`
+
+Launch the app once so OneCLI can bootstrap if needed.
+
+## Develop
 
 ```powershell
 cd C:\OneRust
@@ -31,53 +46,61 @@ Release build:
 npm run tauri build
 ```
 
-## Workflow
+## Firmware update
 
-### Firmware update
+Wizard steps: **Models → Firmware → Targets → Update**.
 
-1. **Models** — Select ThinkSystem V3/V4 models (or add extra 4-character machine types).
-2. **Firmware** — Acquire latest firmware-only ZIPs via OneCLI into `firmware/<MT>/` (or use offline local ZIPs).
-3. **Targets** — Enter shared XCC credentials, concurrency, and BMC IPs (`user:pass@ip` overrides allowed).
-4. **Update** — For each host (all via OneCLI):
-   - Identify serial / machine type (`inventory getinfor --device system_overview`)
-   - Flash the matching Update Bundle (`update flash --bundle --applytime OnReset --noreboot`)
-   - Restart the host (`misc power forcerestart`)
-   - Wait until the BMC answers again (`misc power state`)
-   - Run `update compare` against the local package directory
-   - Mark **verified** only when compare reports no remaining firmware updates
+1. **Models** — Pick ThinkSystem V3/V4 families from the catalog, and/or enter extra 4-character machine types.
+2. **Firmware** — Acquire latest firmware-only ZIPs with OneCLI `update acquire` into `firmware/<MT>/`. Offline mode uses local ZIPs only.
+3. **Targets** — Shared XCC user/password, concurrency, optional TLS verify, and BMC IPs (`user:pass@ip` per-host overrides allowed).
+4. **Update** — For each host, OneCLI:
 
-Per-host progress is written under `logs/<SERIAL>.log`. Compare artifacts go under `logs/compare/<SERIAL>/`.
+| Step | Command |
+|------|---------|
+| Identify serial + machine type | `inventory getinfor --device system_overview` |
+| Stage bundle | `update flash --bundle --applytime OnReset --noreboot` |
+| Reboot | `misc power forcerestart` (or `normalrestart` when graceful) |
+| Wait for BMC | poll `misc power state` |
+| Verify | `update compare` — **verified** only when no further firmware updates are recommended |
 
-### Blueprint
+Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
-Use the **Blueprint** tab to apply an XML/INI/TXT file to one or more BMCs via OneCLI. The file type is auto-detected:
+## Blueprint
 
-| File | Applied as |
-|------|------------|
+Switch to the **Blueprint** tab. Choose a file; OneRust classifies it and applies it concurrently to the BMC list.
+
+| Detected type | OneCLI action |
+|---------------|---------------|
 | RAID `.ini` (`[ctrl…]` / `raid_level`) | `misc raid add --force` |
-| Settings from `config save` (`Setting=Value`) | `config replicate` |
-| Batch of `set …` lines | `config batch` |
-| Firmware compare `.xml` | `update flash --comparexml` (+ package directory) |
+| Settings file (`Setting=Value`, from `config save`) | `config replicate` |
+| Batch file (lines of `set …`) | `config batch` |
+| Firmware compare `.xml` | `update flash --comparexml` (requires a package directory) |
 
-Logs land under `logs/blueprint/<serial>/` (serial resolved with OneCLI `inventory getinfor --device system_overview`).
+Serial for each host is resolved with OneCLI inventory before apply. Progress and OneCLI stdout/stderr are kept under `logs/blueprint/<serial>/`.
 
 ## Layout
 
 ```text
 OneRust/
-  OneCLI/          # auto-downloaded on first run if missing (not committed)
-  firmware/        # acquired packages per machine type
-  logs/            # per-serial update logs + compare output
-  src/             # React UI
-  src-tauri/       # Rust / Tauri backend
+  OneCLI/                 # auto-downloaded on first run (gitignored)
+  firmware/<MT>/          # acquired Update Bundles
+  logs/
+    <SERIAL>.log          # per-host firmware update log
+    identify/             # inventory used for identity
+    flash/<SERIAL>/       # flash command output
+    power/<SERIAL>/       # reboot command output
+    compare/<SERIAL>/     # compare XML / console
+    blueprint/<SERIAL>/   # blueprint apply output
+  src/                    # React UI
+  src-tauri/              # Rust / Tauri + OneCLI orchestration
 ```
 
 ## Notes
 
-- Targets **V3/V4** ThinkSystem hosts managed out-of-band through XCC. All BMC operations use OneCLI (no direct Redfish client).
-- BMC TLS verification is off by default (`--never-check-trust`). Enable “Verify BMC TLS” in the UI if needed.
-- Host reboot uses OneCLI `misc power forcerestart` (or `normalrestart` when graceful is requested).
-- OneCLI, firmware downloads, and logs are gitignored — keep them local. OneCLI is bootstrapped automatically on first launch when missing.
+- Designed for **ThinkSystem V3/V4** out-of-band management through XCC.
+- TLS verification is **off** by default (`--never-check-trust`). Turn on “Verify BMC TLS” in the UI when you need certificate checks.
+- OneCLI, firmware trees, and logs are gitignored — keep them local to each workstation.
+- HTTP is used only to download the OneCLI zip on first run; day-to-day BMC operations are OneCLI subprocesses.
 
 ## License
 
