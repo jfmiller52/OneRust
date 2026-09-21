@@ -101,6 +101,8 @@ export async function applyBlueprint(args: {
   verifyBmcTls: boolean;
   kindOverride?: string | null;
   applytime?: string;
+  rebootAfterApply?: boolean;
+  resetType?: string;
 }): Promise<HostResult[]> {
   return invoke("apply_blueprint", { request: args });
 }

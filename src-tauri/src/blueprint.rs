@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::lenovo::{ensure_onecli, onecli_compare, onecli_identify};
+use crate::lenovo::{ensure_onecli, onecli_compare, onecli_identify, onecli_power_restart};
 use crate::logutil::sanitize_serial;
 use crate::update::TargetHost;
 
@@ -334,6 +334,10 @@ pub struct BlueprintApplyOptions {
     pub logs_dir: PathBuf,
     pub never_check_trust: bool,
     pub applytime: String,
+    /// After a successful apply, restart the host (default true).
+    pub reboot_after_apply: bool,
+    /// ForceRestart (default) or GracefulRestart.
+    pub reset_type: String,
 }
 
 impl Default for BlueprintApplyOptions {
@@ -343,6 +347,8 @@ impl Default for BlueprintApplyOptions {
             logs_dir: PathBuf::from("logs"),
             never_check_trust: true,
             applytime: "OnReset".into(),
+            reboot_after_apply: true,
+            reset_type: "ForceRestart".into(),
         }
     }
 }
@@ -412,8 +418,17 @@ pub async fn apply_blueprint_concurrent(
                 );
             }
 
-            let result =
-                apply_blueprint_one(&onecli, &blueprint, &plan, user, pass, &ip, &opts).await;
+            let result = apply_blueprint_one(
+                &onecli,
+                &blueprint,
+                &plan,
+                user,
+                pass,
+                &ip,
+                &opts,
+                on_progress.as_ref(),
+            )
+            .await;
 
             match result {
                 Ok((serial, detail)) => {
@@ -432,14 +447,23 @@ pub async fn apply_blueprint_concurrent(
                         detail,
                     }
                 }
-                Err(e) => {
+                Err((serial, e)) => {
                     let detail = format!("{e:#}");
                     if let Some(cb) = &on_progress {
-                        cb(ip.clone(), "failed".into(), None, detail.clone());
+                        cb(
+                            ip.clone(),
+                            "failed".into(),
+                            if serial.is_empty() {
+                                None
+                            } else {
+                                Some(serial.clone())
+                            },
+                            detail.clone(),
+                        );
                     }
                     BlueprintHostResult {
                         ip,
-                        serial: String::new(),
+                        serial,
                         outcome: "failed".into(),
                         detail,
                     }
@@ -463,12 +487,18 @@ async fn apply_blueprint_one(
     pass: &str,
     ip: &str,
     opts: &BlueprintApplyOptions,
-) -> Result<(String, String)> {
+    on_progress: Option<&BlueprintProgressCb>,
+) -> Result<(String, String), (String, anyhow::Error)> {
     let fallback = format!("unknown-{}", sanitize_serial(ip));
     let provisional = opts.logs_dir.join("blueprint").join(&fallback);
     tokio::fs::create_dir_all(&provisional)
         .await
-        .with_context(|| format!("create {}", provisional.display()))?;
+        .map_err(|e| {
+            (
+                String::new(),
+                anyhow::Error::new(e).context(format!("create {}", provisional.display())),
+            )
+        })?;
 
     let serial = match onecli_identify(
         user,
@@ -483,19 +513,27 @@ async fn apply_blueprint_one(
         Err(_) => fallback,
     };
 
+    let map_err = |e: anyhow::Error| (serial.clone(), e);
+
     let out_dir = opts.logs_dir.join("blueprint").join(&serial);
     tokio::fs::create_dir_all(&out_dir)
         .await
-        .with_context(|| format!("create {}", out_dir.display()))?;
+        .map_err(|e| {
+            map_err(anyhow::Error::new(e).context(format!("create {}", out_dir.display())))
+        })?;
 
     let content = tokio::fs::read_to_string(blueprint)
         .await
-        .with_context(|| format!("read {}", blueprint.display()))?;
+        .map_err(|e| {
+            map_err(anyhow::Error::new(e).context(format!("read {}", blueprint.display())))
+        })?;
     let parts = split_blueprint_parts(&content);
     let parts_dir = out_dir.join("_parts");
     tokio::fs::create_dir_all(&parts_dir)
         .await
-        .with_context(|| format!("create {}", parts_dir.display()))?;
+        .map_err(|e| {
+            map_err(anyhow::Error::new(e).context(format!("create {}", parts_dir.display())))
+        })?;
 
     let bmc = format!("{user}:{pass}@{ip}");
     let mut done = Vec::new();
@@ -511,7 +549,9 @@ async fn apply_blueprint_one(
         };
         tokio::fs::write(&path, &body)
             .await
-            .with_context(|| format!("write {}", path.display()))?;
+            .map_err(|e| {
+                map_err(anyhow::Error::new(e).context(format!("write {}", path.display())))
+            })?;
         run_onecli(
             onecli,
             &[
@@ -529,7 +569,8 @@ async fn apply_blueprint_one(
             &out_dir,
             "config-replicate",
         )
-        .await?;
+        .await
+        .map_err(map_err)?;
         done.push("config replicate");
     }
 
@@ -542,7 +583,9 @@ async fn apply_blueprint_one(
         };
         tokio::fs::write(&path, &body)
             .await
-            .with_context(|| format!("write {}", path.display()))?;
+            .map_err(|e| {
+                map_err(anyhow::Error::new(e).context(format!("write {}", path.display())))
+            })?;
         run_onecli(
             onecli,
             &[
@@ -560,7 +603,8 @@ async fn apply_blueprint_one(
             &out_dir,
             "config-batch",
         )
-        .await?;
+        .await
+        .map_err(map_err)?;
         done.push("config batch");
     }
 
@@ -573,7 +617,9 @@ async fn apply_blueprint_one(
         };
         tokio::fs::write(&path, &body)
             .await
-            .with_context(|| format!("write {}", path.display()))?;
+            .map_err(|e| {
+                map_err(anyhow::Error::new(e).context(format!("write {}", path.display())))
+            })?;
         run_onecli(
             onecli,
             &[
@@ -593,7 +639,8 @@ async fn apply_blueprint_one(
             &out_dir,
             "raid-add",
         )
-        .await?;
+        .await
+        .map_err(map_err)?;
         done.push("raid add");
     }
 
@@ -601,7 +648,9 @@ async fn apply_blueprint_one(
         let package_dir = opts
             .package_dir
             .as_ref()
-            .context("package directory required for firmware XML")?;
+            .ok_or_else(|| {
+                map_err(anyhow::anyhow!("package directory required for firmware XML"))
+            })?;
         run_onecli(
             onecli,
             &[
@@ -624,8 +673,39 @@ async fn apply_blueprint_one(
             &out_dir,
             "flash-comparexml",
         )
-        .await?;
+        .await
+        .map_err(map_err)?;
         done.push("flash --comparexml");
+    }
+
+    if opts.reboot_after_apply {
+        if let Some(cb) = on_progress {
+            cb(
+                ip.to_string(),
+                "rebooting".into(),
+                Some(serial.clone()),
+                format!("OneCLI misc power ({})…", opts.reset_type),
+            );
+        }
+        let power_dir = opts.logs_dir.join("power").join(&serial);
+        onecli_power_restart(
+            user,
+            pass,
+            ip,
+            &opts.reset_type,
+            &power_dir,
+            opts.never_check_trust,
+        )
+        .await
+        .map_err(|e| {
+            map_err(
+                e.context(format!(
+                    "applied OK but restart failed ({})",
+                    opts.reset_type
+                )),
+            )
+        })?;
+        done.push("restart");
     }
 
     Ok((

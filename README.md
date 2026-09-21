@@ -96,6 +96,9 @@ vol_name=os
 1. `config replicate` (settings lines)
 2. `config batch` (`set …` lines, if present)
 3. `misc raid add --force` (RAID sections)
+4. **Force-restart** each host (`misc power forcerestart`) so applied settings take effect
+
+Verify does **not** reboot.
 
 | Detected part | Apply action |
 |---------------|--------------|

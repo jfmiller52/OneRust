@@ -413,7 +413,7 @@ export default function App() {
           <Shield className="size-3.5 text-signal" />
           {mode === "firmware"
             ? "Flash → reboot → OneCLI compare"
-            : "OneCLI blueprint apply"}
+            : "Apply → restart hosts"}
         </div>
       </header>
 
@@ -504,7 +504,7 @@ export default function App() {
                 <span className="font-mono">set</span> commands, or a firmware
                 compare <span className="font-mono text-rack-300">.xml</span>.
                 OneRust detects each part and runs the matching OneCLI steps
-                (settings → batch → RAID).
+                (settings → batch → RAID), then force-restarts each host.
               </p>
             </div>
 

@@ -420,6 +420,12 @@ pub struct BlueprintApplyRequest {
     pub kind_override: Option<String>,
     #[serde(default = "default_applytime")]
     pub applytime: String,
+    /// After apply, restart each host (default true).
+    #[serde(default = "default_true")]
+    pub reboot_after_apply: bool,
+    /// ForceRestart (default) or GracefulRestart.
+    #[serde(default = "default_reset_type")]
+    pub reset_type: String,
 }
 
 fn default_applytime() -> String {
@@ -509,6 +515,8 @@ pub async fn apply_blueprint(
             logs_dir: PathBuf::from(&request.logs_dir),
             never_check_trust: !request.verify_bmc_tls,
             applytime: request.applytime,
+            reboot_after_apply: request.reboot_after_apply,
+            reset_type: request.reset_type,
         },
         Some(on_progress),
     )
@@ -608,6 +616,8 @@ pub async fn verify_blueprint(
             logs_dir: PathBuf::from(&request.logs_dir),
             never_check_trust: !request.verify_bmc_tls,
             applytime: request.applytime,
+            reboot_after_apply: false,
+            reset_type: request.reset_type,
         },
         Some(on_progress),
     )
