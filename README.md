@@ -2,18 +2,24 @@
 
 Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — powered entirely by **Lenovo XClarity Essentials OneCLI**.
 
-OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply RAID / UEFI / BMC “blueprints” without hand-running CLI scripts per host.
+OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply / verify RAID + UEFI/BMC blueprints without hand-running CLI scripts per host.
 
-**Current release:** [v0.2.0](https://github.com/jfmiller52/OneRust/releases/tag/v0.2.0)
+**Current release:** [v0.3.0](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.0)
 
 ## What it does
 
 | Mode | Purpose |
 |------|---------|
-| **Firmware update** | Acquire Update Bundles, flash them out-of-band (`--bundle` / `OnReset`), reboot, then verify with OneCLI compare |
-| **Blueprint** | Apply a local `.ini` / `.xml` / `.txt` blueprint (RAID policy, config settings, batch `set` commands, or compare XML) to many BMCs |
+| **Firmware update** | Acquire Update Bundles, flash out-of-band (`--bundle` / `OnReset`), reboot, verify with OneCLI compare |
+| **Blueprint** | Apply **or verify** a local `.ini` / `.xml` / `.txt` against many BMCs — settings and RAID can share one file |
 
 All BMC work goes through OneCLI. There is **no Redfish client** in the app.
+
+### What’s new in 0.3.0
+
+- Combined **settings + RAID** in a single blueprint file (auto-split and applied in order)
+- **Verify against hosts** on the Blueprint tab (read-only checks via OneCLI)
+- Outcomes: applied / verified / mismatch / failed, with logs under `logs/blueprint/<serial>/`
 
 ## Prerequisites
 
@@ -27,8 +33,8 @@ On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable
 
 Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
 
-- `OneRust_*_x64-setup.exe` (NSIS), or
-- `OneRust_*_x64_en-US.msi`
+- `OneRust_0.3.0_x64-setup.exe` (NSIS), or
+- `OneRust_0.3.0_x64_en-US.msi`
 
 Launch the app once so OneCLI can bootstrap if needed.
 
@@ -67,9 +73,11 @@ Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
 ## Blueprint
 
-Switch to the **Blueprint** tab. Choose a file; OneRust classifies its parts and applies them concurrently to the BMC list.
+Switch to the **Blueprint** tab. Choose a file; OneRust classifies its parts and can **Apply** or **Verify against hosts**.
 
-A single `.ini` / `.txt` may contain **both** BMC/UEFI settings and RAID policy. Example:
+### Combined settings + RAID file
+
+A single `.ini` / `.txt` may contain both BMC/UEFI settings and RAID policy:
 
 ```ini
 # BMC / UEFI (from config save, or hand-edited Setting=Value lines)
@@ -83,46 +91,58 @@ raid_level=1
 vol_name=os
 ```
 
-OneRust splits the file and runs, in order:
+**Apply** splits the file and runs, in order:
 
 1. `config replicate` (settings lines)
 2. `config batch` (`set …` lines, if present)
 3. `misc raid add --force` (RAID sections)
 
-| Detected part | OneCLI action |
-|---------------|---------------|
+| Detected part | Apply action |
+|---------------|--------------|
 | `Setting=Value` lines | `config replicate` |
 | `set …` lines | `config batch` |
 | `[ctrl…]` / RAID keys | `misc raid add --force` |
-| Firmware compare `.xml` | `update flash --comparexml` (requires a package directory; separate file) |
+| Firmware compare `.xml` | `update flash --comparexml` (needs a package directory; separate file) |
 
-Serial for each host is resolved with OneCLI inventory before apply. Split parts and OneCLI stdout/stderr land under `logs/blueprint/<serial>/` (including `_parts/`).
+### Verify against hosts
 
-**Verify against hosts** (read-only) checks the live BMC against the same blueprint:
+Read-only check of the live BMC against the same blueprint:
 
 | Part | Verify method |
 |------|----------------|
 | Settings / batch | `config compare --file` (batch `set` lines converted to `Setting=Value`) |
 | RAID | `misc raid show`, then look for expected `vol_name` / RAID level |
-| Firmware XML | `update compare` against the package directory (verified when no updates remain) |
+| Firmware XML | `update compare` against the package directory (pass when no updates remain) |
 
 Outcomes: **verified**, **mismatch**, or **failed**. Details under `logs/blueprint/<serial>/verify/`.
+
+Suggested layout for your own library:
+
+```text
+blueprints/
+  sr650v3-baseline.ini      # settings + RAID together
+  batch/
+    ldap.txt                # set … lines only
+  firmware/
+    7D76-compare.xml        # from update compare
+```
 
 ## Layout
 
 ```text
 OneRust/
-  OneCLI/                 # auto-downloaded on first run (gitignored)
-  firmware/<MT>/          # acquired Update Bundles
+  OneCLI/                      # auto-downloaded on first run (gitignored)
+  firmware/<MT>/               # acquired Update Bundles
   logs/
-    <SERIAL>.log          # per-host firmware update log
-    identify/             # inventory used for identity
-    flash/<SERIAL>/       # flash command output
-    power/<SERIAL>/       # reboot command output
-    compare/<SERIAL>/     # compare XML / console
-    blueprint/<SERIAL>/   # blueprint apply output
-  src/                    # React UI
-  src-tauri/              # Rust / Tauri + OneCLI orchestration
+    <SERIAL>.log               # per-host firmware update log
+    identify/                  # inventory used for identity
+    flash/<SERIAL>/            # flash command output
+    power/<SERIAL>/            # reboot command output
+    compare/<SERIAL>/          # compare XML / console
+    blueprint/<SERIAL>/        # apply output + _parts/
+    blueprint/<SERIAL>/verify/ # verify output
+  src/                         # React UI
+  src-tauri/                   # Rust / Tauri + OneCLI orchestration
 ```
 
 ## Notes
