@@ -105,6 +105,21 @@ export async function applyBlueprint(args: {
   return invoke("apply_blueprint", { request: args });
 }
 
+export async function verifyBlueprint(args: {
+  blueprintPath: string;
+  hostsText: string;
+  username: string;
+  password: string;
+  concurrency: number;
+  logsDir: string;
+  packageDir?: string | null;
+  verifyBmcTls: boolean;
+  kindOverride?: string | null;
+  applytime?: string;
+}): Promise<HostResult[]> {
+  return invoke("verify_blueprint", { request: args });
+}
+
 export async function pickBlueprintFile(): Promise<string | null> {
   const selected = await open({
     multiple: false,

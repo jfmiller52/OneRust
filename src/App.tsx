@@ -30,6 +30,7 @@ import {
   pickPackageDirectory,
   resolveMachineTypes,
   startUpdates,
+  verifyBlueprint,
   type BlueprintInfo,
   type DownloadProgress,
   type HostProgress,
@@ -57,6 +58,7 @@ function statusColor(status: string) {
       return "text-ok";
     case "failed":
     case "error":
+    case "mismatch":
       return "text-bad";
     case "skipped":
     case "queued":
@@ -331,6 +333,46 @@ export default function App() {
     }
   };
 
+  const runBlueprintVerify = async () => {
+    setError(null);
+    if (!blueprintPath) {
+      setError("Choose a blueprint file (.ini / .xml / .txt).");
+      return;
+    }
+    const n = await validateHosts();
+    if (!n) return;
+    if (!password) {
+      setError("XCC password is required.");
+      return;
+    }
+    if (blueprintInfo?.needsPackageDir && !packageDir.trim()) {
+      setError("Firmware XML blueprints need a package directory to verify.");
+      return;
+    }
+
+    setBlueprintRunning(true);
+    setBlueprintResults([]);
+    setBlueprintProgress({});
+    try {
+      await ensureOnecliReady();
+      const res = await verifyBlueprint({
+        blueprintPath,
+        hostsText,
+        username,
+        password,
+        concurrency,
+        logsDir,
+        packageDir: blueprintInfo?.needsPackageDir ? packageDir : null,
+        verifyBmcTls: verifyTls,
+      });
+      setBlueprintResults(res);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBlueprintRunning(false);
+    }
+  };
+
   const summary = useMemo(() => {
     const verified = results.filter((r) => r.outcome === "verified").length;
     const staged = results.filter((r) => r.outcome === "staged").length;
@@ -341,8 +383,10 @@ export default function App() {
 
   const blueprintSummary = useMemo(() => {
     const applied = blueprintResults.filter((r) => r.outcome === "applied").length;
+    const verified = blueprintResults.filter((r) => r.outcome === "verified").length;
+    const mismatch = blueprintResults.filter((r) => r.outcome === "mismatch").length;
     const failed = blueprintResults.filter((r) => r.outcome === "failed").length;
-    return { applied, failed };
+    return { applied, verified, mismatch, failed };
   }, [blueprintResults]);
 
   const downloadPct =
@@ -452,15 +496,15 @@ export default function App() {
               <h2 className="text-lg font-medium">Apply blueprint</h2>
               <p className="mt-1 text-sm text-rack-400">
                 Choose an{" "}
-                <span className="font-mono text-rack-300">.ini</span> RAID
-                policy, a settings{" "}
-                <span className="font-mono text-rack-300">.txt</span> /{" "}
-                <span className="font-mono text-rack-300">.ini</span> from OneCLI{" "}
-                <span className="font-mono">config save</span>, a{" "}
-                <span className="font-mono">config batch</span> file, or a
-                firmware compare{" "}
-                <span className="font-mono text-rack-300">.xml</span>. OneRust
-                detects the type and applies it to each BMC via OneCLI.
+                <span className="font-mono text-rack-300">.ini</span> /{" "}
+                <span className="font-mono text-rack-300">.txt</span> that can
+                include BMC/UEFI settings and RAID policy in the{" "}
+                <span className="font-medium text-rack-300">same file</span>, a{" "}
+                <span className="font-mono">config batch</span> of{" "}
+                <span className="font-mono">set</span> commands, or a firmware
+                compare <span className="font-mono text-rack-300">.xml</span>.
+                OneRust detects each part and runs the matching OneCLI steps
+                (settings → batch → RAID).
               </p>
             </div>
 
@@ -587,9 +631,16 @@ export default function App() {
               </p>
             </div>
 
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={runBlueprintVerify}
+                disabled={blueprintRunning}
+              >
+                {blueprintRunning ? "Working…" : "Verify against hosts"}
+              </Button>
               <Button onClick={runBlueprint} disabled={blueprintRunning}>
-                {blueprintRunning ? "Applying…" : "Apply blueprint"}
+                {blueprintRunning ? "Working…" : "Apply blueprint"}
               </Button>
             </div>
 
@@ -600,7 +651,7 @@ export default function App() {
                 {Object.values(blueprintProgress).length === 0 &&
                   blueprintResults.length === 0 && (
                     <li className="text-rack-400">
-                      Per-host progress appears here after you apply.
+                      Per-host progress appears here after you apply or verify.
                     </li>
                   )}
                 {(blueprintResults.length
@@ -631,6 +682,8 @@ export default function App() {
             {blueprintResults.length > 0 && (
               <div className="flex flex-wrap gap-6 font-mono text-sm">
                 <span className="text-ok">applied {blueprintSummary.applied}</span>
+                <span className="text-ok">verified {blueprintSummary.verified}</span>
+                <span className="text-warn">mismatch {blueprintSummary.mismatch}</span>
                 <span className="text-bad">failed {blueprintSummary.failed}</span>
               </div>
             )}

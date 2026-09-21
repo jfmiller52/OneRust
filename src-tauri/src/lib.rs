@@ -22,6 +22,7 @@ pub fn run() {
             commands::default_paths,
             commands::classify_blueprint,
             commands::apply_blueprint,
+            commands::verify_blueprint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running OneRust");

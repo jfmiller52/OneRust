@@ -1,7 +1,8 @@
 //! Tauri command handlers for the OneRust GUI.
 
 use crate::blueprint::{
-    apply_blueprint_concurrent, classify_blueprint_file, BlueprintApplyOptions, BlueprintKind,
+    apply_blueprint_concurrent, classify_blueprint_file, plan_from_override,
+    verify_blueprint_concurrent, BlueprintApplyOptions,
 };
 use crate::catalog::{
     machine_types_from_selection, model_name_for_mt, MODELS,
@@ -415,6 +416,7 @@ pub struct BlueprintApplyRequest {
     pub package_dir: Option<String>,
     pub verify_bmc_tls: bool,
     /// Optional override: raid | config-settings | config-batch | firmware-xml
+    /// (combine with `+`, e.g. `settings+raid`)
     pub kind_override: Option<String>,
     #[serde(default = "default_applytime")]
     pub applytime: String,
@@ -422,16 +424,6 @@ pub struct BlueprintApplyRequest {
 
 fn default_applytime() -> String {
     "OnReset".into()
-}
-
-fn parse_kind_override(s: &str) -> Result<BlueprintKind, String> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "raid" => Ok(BlueprintKind::Raid),
-        "config-settings" | "settings" | "replicate" => Ok(BlueprintKind::ConfigSettings),
-        "config-batch" | "batch" => Ok(BlueprintKind::ConfigBatch),
-        "firmware-xml" | "firmware" | "xml" => Ok(BlueprintKind::FirmwareCompareXml),
-        other => Err(format!("Unknown blueprint kind '{other}'")),
-    }
 }
 
 #[tauri::command]
@@ -442,7 +434,7 @@ pub async fn classify_blueprint(path: String) -> Result<BlueprintInfo, String> {
         .map_err(|e| format!("{e:#}"))?;
     Ok(BlueprintInfo {
         path: path.display().to_string(),
-        kind: info.kind.as_str().to_string(),
+        kind: info.plan.as_str(),
         label: info.label,
         detail: info.detail,
         needs_package_dir: info.needs_package_dir,
@@ -459,13 +451,13 @@ pub async fn apply_blueprint(
         return Err(format!("Blueprint file not found: {}", path.display()));
     }
 
-    let kind = if let Some(over) = &request.kind_override {
-        parse_kind_override(over)?
+    let plan = if let Some(over) = &request.kind_override {
+        plan_from_override(over).map_err(|e| format!("{e:#}"))?
     } else {
         classify_blueprint_file(&path)
             .await
             .map_err(|e| format!("{e:#}"))?
-            .kind
+            .plan
     };
 
     let hosts = parse_hosts_text(&request.hosts_text).map_err(|e| e.to_string())?;
@@ -486,7 +478,7 @@ pub async fn apply_blueprint(
                 ip: h.ip.clone(),
                 serial: None,
                 status: "queued".into(),
-                detail: format!("Waiting to apply {}…", kind.label()),
+                detail: format!("Waiting to apply {}…", plan.label()),
             },
         );
     }
@@ -507,7 +499,106 @@ pub async fn apply_blueprint(
 
     let results = apply_blueprint_concurrent(
         path,
-        kind,
+        plan,
+        hosts,
+        request.username,
+        request.password,
+        request.concurrency.max(1),
+        BlueprintApplyOptions {
+            package_dir: request.package_dir.map(PathBuf::from),
+            logs_dir: PathBuf::from(&request.logs_dir),
+            never_check_trust: !request.verify_bmc_tls,
+            applytime: request.applytime,
+        },
+        Some(on_progress),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+
+    let mut dtos = Vec::new();
+    for r in results {
+        let _ = app.emit(
+            "host-progress",
+            HostProgress {
+                ip: r.ip.clone(),
+                serial: if r.serial.is_empty() {
+                    None
+                } else {
+                    Some(r.serial.clone())
+                },
+                status: r.outcome.clone(),
+                detail: r.detail.clone(),
+            },
+        );
+        dtos.push(HostResultDto {
+            ip: r.ip,
+            serial: r.serial,
+            outcome: r.outcome,
+            detail: r.detail,
+        });
+    }
+    Ok(dtos)
+}
+
+#[tauri::command]
+pub async fn verify_blueprint(
+    app: AppHandle,
+    request: BlueprintApplyRequest,
+) -> Result<Vec<HostResultDto>, String> {
+    let path = PathBuf::from(&request.blueprint_path);
+    if !path.is_file() {
+        return Err(format!("Blueprint file not found: {}", path.display()));
+    }
+
+    let plan = if let Some(over) = &request.kind_override {
+        plan_from_override(over).map_err(|e| format!("{e:#}"))?
+    } else {
+        classify_blueprint_file(&path)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .plan
+    };
+
+    let hosts = parse_hosts_text(&request.hosts_text).map_err(|e| e.to_string())?;
+    if hosts.is_empty() {
+        return Err("No host IPs provided".into());
+    }
+    if request.username.trim().is_empty() {
+        return Err("Username is required".into());
+    }
+    if request.password.is_empty() {
+        return Err("Password is required".into());
+    }
+
+    for h in &hosts {
+        let _ = app.emit(
+            "host-progress",
+            HostProgress {
+                ip: h.ip.clone(),
+                serial: None,
+                status: "queued".into(),
+                detail: format!("Waiting to verify {}…", plan.label()),
+            },
+        );
+    }
+
+    let app_progress = app.clone();
+    let on_progress: crate::blueprint::BlueprintProgressCb =
+        std::sync::Arc::new(move |ip, status, serial, detail| {
+            let _ = app_progress.emit(
+                "host-progress",
+                HostProgress {
+                    ip,
+                    serial,
+                    status,
+                    detail,
+                },
+            );
+        });
+
+    let results = verify_blueprint_concurrent(
+        path,
+        plan,
         hosts,
         request.username,
         request.password,
