@@ -4,7 +4,7 @@ Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — po
 
 OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply / verify RAID + UEFI/BMC blueprints without hand-running CLI scripts per host.
 
-**Current release:** [v0.3.0](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.0)
+**Current release:** [v0.3.1](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.1)
 
 ## What it does
 
@@ -15,7 +15,12 @@ OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and a
 
 All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 
-### What’s new in 0.3.0
+### What’s new in 0.3.1
+
+- After a successful **blueprint apply**, each host is **force-restarted** (`misc power forcerestart`) so settings take effect
+- Verify against hosts remains read-only (no reboot)
+
+### From 0.3.0
 
 - Combined **settings + RAID** in a single blueprint file (auto-split and applied in order)
 - **Verify against hosts** on the Blueprint tab (read-only checks via OneCLI)
@@ -33,8 +38,8 @@ On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable
 
 Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
 
-- `OneRust_0.3.0_x64-setup.exe` (NSIS), or
-- `OneRust_0.3.0_x64_en-US.msi`
+- `OneRust_0.3.1_x64-setup.exe` (NSIS), or
+- `OneRust_0.3.1_x64_en-US.msi`
 
 Launch the app once so OneCLI can bootstrap if needed.
 

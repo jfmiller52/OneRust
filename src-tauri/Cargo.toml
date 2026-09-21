@@ -1,6 +1,6 @@
 [package]
 name = "onerust"
-version = "0.3.0"
+version = "0.3.1"
 description = "Mass-update Lenovo ThinkSystem V3/V4 firmware via OneCLI"
 authors = ["OneRust"]
 edition = "2021"
