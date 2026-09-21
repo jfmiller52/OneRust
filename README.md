@@ -4,7 +4,7 @@ Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — po
 
 OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply / verify RAID + UEFI/BMC blueprints without hand-running CLI scripts per host.
 
-**Current release:** [v0.3.1](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.1)
+**Current release:** [v0.3.2](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.2)
 
 ## What it does
 
@@ -15,14 +15,19 @@ OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and a
 
 All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 
-### What’s new in 0.3.1
+### What’s new in 0.3.2
+
+- Combined blueprints use an explicit **`#RAID`** marker: everything below it is written verbatim to a temp INI for `misc raid add`
+- Settings / batch lines stay above `#RAID`; RAID-only files without a marker still work
+
+### From 0.3.1
 
 - After a successful **blueprint apply**, each host is **force-restarted** (`misc power forcerestart`) so settings take effect
 - Verify against hosts remains read-only (no reboot)
 
 ### From 0.3.0
 
-- Combined **settings + RAID** in a single blueprint file (auto-split and applied in order)
+- Combined **settings + RAID** in a single blueprint file
 - **Verify against hosts** on the Blueprint tab (read-only checks via OneCLI)
 - Outcomes: applied / verified / mismatch / failed, with logs under `logs/blueprint/<serial>/`
 
@@ -38,8 +43,8 @@ On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable
 
 Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
 
-- `OneRust_0.3.1_x64-setup.exe` (NSIS), or
-- `OneRust_0.3.1_x64_en-US.msi`
+- `OneRust_0.3.2_x64-setup.exe` (NSIS), or
+- `OneRust_0.3.2_x64_en-US.msi`
 
 Launch the app once so OneCLI can bootstrap if needed.
 
@@ -82,34 +87,37 @@ Switch to the **Blueprint** tab. Choose a file; OneRust classifies its parts and
 
 ### Combined settings + RAID file
 
-A single `.ini` / `.txt` may contain both BMC/UEFI settings and RAID policy:
+Put BMC/UEFI settings (and optional `set …` batch lines) **above** a `#RAID` marker.
+**Everything below `#RAID`** is written to a temporary `.ini` and sent with `misc raid add --force` — use OneCLI’s RAID sample format as-is.
 
 ```ini
 # BMC / UEFI (from config save, or hand-edited Setting=Value lines)
 UEFI.BootMode=UEFI Mode
 IMM.HostName1=node01
 
-# RAID (OneCLI Sample/RAID_HW_new.ini style)
+#RAID
 [ctrl1-vol0]
 disks=0,1
 raid_level=1
 vol_name=os
 ```
 
+`# RAID` (with a space) or `#RAID: …` also works as the marker. RAID-only files (no marker) still work when they use `[ctrl…]` sections.
+
 **Apply** splits the file and runs, in order:
 
-1. `config replicate` (settings lines)
-2. `config batch` (`set …` lines, if present)
-3. `misc raid add --force` (RAID sections)
+1. `config replicate` (settings lines above `#RAID`)
+2. `config batch` (`set …` lines above `#RAID`, if present)
+3. `misc raid add --force` (verbatim body below `#RAID`)
 4. **Force-restart** each host (`misc power forcerestart`) so applied settings take effect
 
 Verify does **not** reboot.
 
 | Detected part | Apply action |
 |---------------|--------------|
-| `Setting=Value` lines | `config replicate` |
-| `set …` lines | `config batch` |
-| `[ctrl…]` / RAID keys | `misc raid add --force` |
+| Lines above `#RAID` (`Setting=Value`) | `config replicate` |
+| Lines above `#RAID` (`set …`) | `config batch` |
+| Body below `#RAID` (or RAID-only `[ctrl…]` file) | `misc raid add --force` |
 | Firmware compare `.xml` | `update flash --comparexml` (needs a package directory; separate file) |
 
 ### Verify against hosts

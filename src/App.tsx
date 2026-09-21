@@ -499,12 +499,15 @@ export default function App() {
                 <span className="font-mono text-rack-300">.ini</span> /{" "}
                 <span className="font-mono text-rack-300">.txt</span> that can
                 include BMC/UEFI settings and RAID policy in the{" "}
-                <span className="font-medium text-rack-300">same file</span>, a{" "}
-                <span className="font-mono">config batch</span> of{" "}
+                <span className="font-medium text-rack-300">same file</span>{" "}
+                (settings above a{" "}
+                <span className="font-mono text-rack-300">#RAID</span> marker),
+                a <span className="font-mono">config batch</span> of{" "}
                 <span className="font-mono">set</span> commands, or a firmware
                 compare <span className="font-mono text-rack-300">.xml</span>.
-                OneRust detects each part and runs the matching OneCLI steps
-                (settings → batch → RAID), then force-restarts each host.
+                OneRust runs settings → batch → RAID (body below{" "}
+                <span className="font-mono">#RAID</span>), then force-restarts
+                each host.
               </p>
             </div>
 

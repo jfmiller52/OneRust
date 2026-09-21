@@ -1,7 +1,9 @@
 //! Apply OneCLI XML/INI "blueprints" (RAID, BMC/UEFI settings, firmware compare).
 //!
-//! A single `.ini` / `.txt` file may contain both UEFI/BMC settings and RAID policy;
-//! OneRust splits the parts and runs the matching OneCLI commands in order.
+//! A single `.ini` / `.txt` file may contain both UEFI/BMC settings and RAID policy.
+//! Prefer an explicit `#RAID` marker: everything below it is written to a temp
+//! INI and applied with `misc raid add`. Without a marker, OneRust falls back
+//! to section/key heuristics.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -184,6 +186,7 @@ pub fn classify_blueprint_content(ext: &str, content: &str) -> Result<BlueprintP
     let parts = split_blueprint_parts(content);
     let mut plan = BlueprintPlan {
         raid: !parts.raid.trim().is_empty()
+            || split_at_raid_marker(content).is_some()
             || (ext == "ini" && lower.contains("raid_level")),
         config_settings: !parts.settings.trim().is_empty(),
         config_batch: !parts.batch.trim().is_empty(),
@@ -209,7 +212,76 @@ struct BlueprintParts {
 }
 
 /// Split a unified blueprint into OneCLI-ready fragments.
+///
+/// Preferred combined-file layout: settings/batch above an explicit `#RAID`
+/// marker; **everything below that marker** (verbatim) becomes the RAID INI
+/// passed to `misc raid add`. Without a marker, fall back to section/key
+/// heuristics for RAID-only or legacy combined files.
 fn split_blueprint_parts(content: &str) -> BlueprintParts {
+    if let Some((before, after)) = split_at_raid_marker(content) {
+        let mut parts = split_non_raid_lines(before);
+        parts.raid = after.to_string();
+        if !parts.raid.is_empty() && !parts.raid.ends_with('\n') {
+            parts.raid.push('\n');
+        }
+        return parts;
+    }
+
+    split_blueprint_parts_heuristic(content)
+}
+
+/// `#RAID` / `# RAID` (optional description after) starts the RAID section.
+fn is_raid_marker_line(trimmed: &str) -> bool {
+    let body = if let Some(rest) = trimmed.strip_prefix('#') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(';') {
+        rest
+    } else {
+        return false;
+    };
+    let body = body.trim_start();
+    let lower = body.to_ascii_lowercase();
+    lower == "raid"
+        || lower.starts_with("raid ")
+        || lower.starts_with("raid\t")
+        || lower.starts_with("raid:")
+        || lower.starts_with("raid-")
+        || lower.starts_with("raid(")
+}
+
+fn split_at_raid_marker(content: &str) -> Option<(&str, &str)> {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        // strip trailing \r from split_inclusive on Windows files
+        let trimmed = trimmed.trim_end_matches('\r');
+        if is_raid_marker_line(trimmed) {
+            let after = &content[offset + line.len()..];
+            let before = &content[..offset];
+            return Some((before, after));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn split_non_raid_lines(content: &str) -> BlueprintParts {
+    let mut parts = BlueprintParts::default();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("set ") {
+            parts.batch.push_str(line);
+            parts.batch.push('\n');
+        } else if is_settings_line(trimmed) {
+            parts.settings.push_str(line);
+            parts.settings.push('\n');
+        }
+    }
+    parts
+}
+
+fn split_blueprint_parts_heuristic(content: &str) -> BlueprintParts {
     let mut parts = BlueprintParts::default();
     let mut in_raid = false;
 
@@ -1329,7 +1401,7 @@ vol_name=os
 UEFI.BootMode=UEFI Mode
 IMM.HostName1=node01
 
-# RAID
+#RAID
 [ctrl1-vol0]
 disks=0,1
 raid_level=1
@@ -1346,6 +1418,38 @@ vol_name=os
         assert!(parts.raid.contains("raid_level=1"));
         assert!(!parts.raid.contains("UEFI.BootMode"));
         assert!(!parts.settings.contains("raid_level"));
+        assert!(!parts.raid.contains("#RAID"));
+    }
+
+    #[test]
+    fn raid_marker_takes_verbatim_body() {
+        // Non-[ctrl] headers still go to raid.ini when below #RAID
+        let file = r#"
+IMM.HostName1=node01
+# RAID (OneCLI sample)
+[Volumes]
+disks=0,1
+raid_level=1
+vol_name=os
+extra_policy=WriteBack
+"#;
+        let parts = split_blueprint_parts(file);
+        assert!(parts.settings.contains("IMM.HostName1=node01"));
+        assert!(parts.raid.contains("[Volumes]"));
+        assert!(parts.raid.contains("extra_policy=WriteBack"));
+        assert!(!parts.raid.contains("IMM.HostName1"));
+        assert!(!parts.settings.contains("extra_policy"));
+
+        let plan = classify_blueprint_content("ini", file).unwrap();
+        assert!(plan.config_settings && plan.raid);
+    }
+
+    #[test]
+    fn raid_only_without_marker_still_works() {
+        let ini = "[ctrl1-vol0]\ndisks=0,1\nraid_level=1\nvol_name=os\n";
+        let parts = split_blueprint_parts(ini);
+        assert!(parts.raid.contains("[ctrl1-vol0]"));
+        assert!(parts.settings.trim().is_empty());
     }
 
     #[test]
