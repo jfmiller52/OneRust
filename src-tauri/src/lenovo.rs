@@ -14,8 +14,12 @@ use tokio::process::Command;
 pub const ONECLI_DOWNLOAD_URL: &str =
     "https://download.lenovo.com/servers/mig/2026/09/02/65219/lnvgy_utl_lxce_onecli01m-5.7.0_windows_indiv.zip";
 
+/// SHA-256 of `ONECLI_DOWNLOAD_URL` (lowercase hex). Bump URL + hash together.
+pub const ONECLI_ZIP_SHA256: &str =
+    "9e9753b541b16ba753beef09f11bd6b3bd84c5b5634dc7c32bfd0958e9e9408d";
+
 const ONECLI_ZIP_NAME: &str = "lnvgy_utl_lxce_onecli01m-5.7.0_windows_indiv.zip";
-const USER_AGENT: &str = "OneRust/0.1";
+const USER_AGENT: &str = "OneRust/0.3.2";
 
 /// HTTP client (kept for shared use; firmware acquire uses OneCLI).
 pub fn download_client() -> Result<Client> {
@@ -125,6 +129,7 @@ pub async fn ensure_onecli() -> Result<PathBuf> {
     if !zip_path.is_file() {
         download_file(&client, ONECLI_DOWNLOAD_URL, &zip_path).await?;
     }
+    verify_onecli_zip_sha256(&zip_path).await?;
 
     extract_zip(&zip_path, &dest_dir)
         .await
@@ -162,6 +167,34 @@ async fn download_file(client: &Client, url: &str, dest: &Path) -> Result<()> {
     fs::rename(&tmp, dest)
         .await
         .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
+    Ok(())
+}
+
+async fn verify_onecli_zip_sha256(path: &Path) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+
+    let mut file = fs::File::open(path)
+        .await
+        .with_context(|| format!("open {} for checksum", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 256];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    if digest != ONECLI_ZIP_SHA256 {
+        let _ = fs::remove_file(path).await;
+        bail!(
+            "OneCLI zip checksum mismatch for {} (got {digest}, expected {ONECLI_ZIP_SHA256}). \
+             Re-download or bump ONECLI_DOWNLOAD_URL + ONECLI_ZIP_SHA256 together.",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -262,14 +295,16 @@ pub async fn onecli_acquire(
         })
 }
 
-/// Locate an existing ZIP under firmware/<mt>/ (prefer filenames that look like bundles).
+/// Locate an existing ZIP under firmware/<mt>/ (prefer MT in name, then bundle-like names).
 pub async fn find_local_bundle(firmware_root: &Path, mt: &str) -> Result<Option<PathBuf>> {
-    let dir = firmware_root.join(mt.to_uppercase());
+    let mt_upper = mt.to_uppercase();
+    let mt_lower = mt.to_ascii_lowercase();
+    let dir = firmware_root.join(&mt_upper);
     if !dir.is_dir() {
         return Ok(None);
     }
 
-    let mut zips: Vec<(u64, PathBuf)> = Vec::new();
+    let mut zips: Vec<(u8, u64, PathBuf)> = Vec::new();
     let mut stack = vec![dir];
     while let Some(current) = stack.pop() {
         let mut entries = fs::read_dir(&current).await?;
@@ -291,7 +326,14 @@ pub async fn find_local_bundle(firmware_root: &Path, mt: &str) -> Result<Option<
                 continue;
             }
             let meta = fs::metadata(&path).await?;
-            zips.push((meta.len(), path));
+            let mut rank: u8 = 0;
+            if name.contains(&mt_lower) {
+                rank += 2;
+            }
+            if is_bundle_name(&path) {
+                rank += 1;
+            }
+            zips.push((rank, meta.len(), path));
         }
     }
 
@@ -299,12 +341,8 @@ pub async fn find_local_bundle(firmware_root: &Path, mt: &str) -> Result<Option<
         return Ok(None);
     }
 
-    zips.sort_by(|a, b| {
-        let a_bundle = is_bundle_name(&a.1);
-        let b_bundle = is_bundle_name(&b.1);
-        b_bundle.cmp(&a_bundle).then(b.0.cmp(&a.0))
-    });
-    Ok(zips.into_iter().next().map(|(_, p)| p))
+    zips.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    Ok(zips.into_iter().next().map(|(_, _, p)| p))
 }
 
 fn is_bundle_name(path: &Path) -> bool {
@@ -321,6 +359,7 @@ pub async fn acquire_bundle_for_mt(
     mt: &str,
     firmware_root: &Path,
     offline_only: bool,
+    force_reacquire: bool,
 ) -> Result<PathBuf> {
     if offline_only {
         return find_local_bundle(firmware_root, mt)
@@ -333,8 +372,10 @@ pub async fn acquire_bundle_for_mt(
             });
     }
 
-    if let Some(local) = find_local_bundle(firmware_root, mt).await? {
-        return Ok(local);
+    if !force_reacquire {
+        if let Some(local) = find_local_bundle(firmware_root, mt).await? {
+            return Ok(local);
+        }
     }
 
     let onecli = ensure_onecli().await?;
@@ -634,16 +675,31 @@ pub async fn onecli_wait_bmc_ready(
     bmc_ip: &str,
     timeout: Duration,
     never_check_trust: bool,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    use crate::cancel::JobCancel;
+
+    if cancel.is_some_and(JobCancel::is_cancelled) {
+        bail!("cancelled while waiting for BMC {bmc_ip}");
+    }
+
     let onecli = ensure_onecli().await?;
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
     let start = std::time::Instant::now();
     let mut saw_down = false;
 
-    // Give the host a moment to drop after restart.
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    // Give the host a moment to drop after restart (interruptible).
+    for _ in 0..20 {
+        if cancel.is_some_and(JobCancel::is_cancelled) {
+            bail!("cancelled while waiting for BMC {bmc_ip}");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 
     loop {
+        if cancel.is_some_and(JobCancel::is_cancelled) {
+            bail!("cancelled while waiting for BMC {bmc_ip}");
+        }
         if start.elapsed() > timeout {
             bail!(
                 "timed out waiting for BMC {bmc_ip} after {}s",
@@ -654,7 +710,8 @@ pub async fn onecli_wait_bmc_ready(
         let mut cmd = Command::new(&onecli);
         cmd.args(["misc", "power", "state", "--bmc", &bmc, "--quiet"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if never_check_trust {
             cmd.arg("--never-check-trust");
         }
@@ -676,9 +733,7 @@ pub async fn onecli_wait_bmc_ready(
                     return Ok(());
                 }
             }
-            _ => {
-                saw_down = true;
-            }
+            _ => {}
         }
 
         tokio::time::sleep(Duration::from_secs(15)).await;
@@ -919,51 +974,88 @@ pub async fn count_packages_needed(output_dir: &Path, console: &str) -> Result<u
         return Ok(hits);
     }
 
-    Ok(count_update_packages_in_xml(&xml_blob))
+    count_update_packages_in_xml(&xml_blob)
 }
 
-/// Count Package nodes that look like they still need flashing.
-pub fn count_update_packages_in_xml(xml: &str) -> usize {
-    let lower = xml.to_lowercase();
-    // Explicit "no update" markers inside package nodes
-    if lower.contains("<compareresult>noupdate</compareresult>")
-        || lower.contains("<compareresult>no update</compareresult>")
-        || lower.contains("<compareresult>current</compareresult>")
-        || lower.contains("<compareresult>uptodate</compareresult>")
-    {
-        // Count only packages marked as needing update
-        let mut needed = 0usize;
-        for chunk in lower.split("<package").skip(1) {
-            if chunk.contains("<compareresult>update</compareresult>")
-                || chunk.contains("<compareresult>upgrade</compareresult>")
-                || chunk.contains("<compareresult>notinstalled</compareresult>")
-                || chunk.contains("<compareresult>downgrade</compareresult>")
-                || chunk.contains("updaterequired>true")
-                || chunk.contains("<tobeflashed>true")
-            {
-                needed += 1;
+/// Count Package nodes that still need flashing. Unknown CompareResult → error.
+pub fn count_update_packages_in_xml(xml: &str) -> Result<usize> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let trimmed = xml.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut needed = 0usize;
+    let mut packages = 0usize;
+    let mut in_package = 0usize;
+    let mut in_compare_result = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
+                if name == "package" {
+                    packages += 1;
+                    in_package += 1;
+                } else if name == "compareresult" && in_package > 0 {
+                    in_compare_result = true;
+                }
             }
+            Ok(Event::Empty(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
+                if name == "package" {
+                    bail!("compare XML Package has no CompareResult");
+                }
+            }
+            Ok(Event::Text(t)) => {
+                if in_compare_result {
+                    let val = t.unescape().unwrap_or_default().to_ascii_lowercase();
+                    let val = val.trim();
+                    match val {
+                        "noupdate" | "no update" | "current" | "uptodate" | "up-to-date"
+                        | "same" | "match" => {}
+                        "update" | "upgrade" | "notinstalled" | "not installed" | "downgrade"
+                        | "critical" => needed += 1,
+                        other if other.is_empty() => {
+                            bail!("compare XML Package has empty CompareResult");
+                        }
+                        other => {
+                            bail!("unknown CompareResult '{other}' in compare XML");
+                        }
+                    }
+                    in_compare_result = false;
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_ascii_lowercase();
+                if name == "compareresult" {
+                    in_compare_result = false;
+                } else if name == "package" {
+                    in_package = in_package.saturating_sub(1);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => bail!("failed to parse compare XML: {e}"),
+            _ => {}
         }
-        return needed;
+        buf.clear();
     }
 
-    // If CompareResult=Update style appears globally
-    let update_markers = lower.matches("<compareresult>update</compareresult>").count()
-        + lower.matches("<compareresult>upgrade</compareresult>").count()
-        + lower.matches("updaterequired>true").count()
-        + lower.matches("<tobeflashed>true").count();
-    if update_markers > 0 {
-        return update_markers;
+    if packages == 0 {
+        // No Package nodes — not a usable compare document
+        if xml.to_ascii_lowercase().contains("<package") {
+            bail!("compare XML looks malformed (unclosed Package nodes)");
+        }
+        return Ok(0);
     }
 
-    // Some OneCLI builds emit a flash list of Package IDs only when updates are needed.
-    // If we only see Package nodes without clear "current" markers, treat each as needed.
-    let package_opens = lower.matches("<package").count();
-    if package_opens == 0 {
-        return 0;
-    }
-    // Prefer conservative: if XML has packages but no clear up-to-date markers, count them.
-    package_opens
+    Ok(needed)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -996,6 +1088,43 @@ mod tests {
     fn onecli_url_is_windows_zip() {
         assert!(ONECLI_DOWNLOAD_URL.contains("onecli"));
         assert!(ONECLI_DOWNLOAD_URL.ends_with(".zip"));
+        assert_eq!(ONECLI_ZIP_SHA256.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn find_local_bundle_prefers_mt_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mt_dir = dir.path().join("7D75");
+        tokio::fs::create_dir_all(&mt_dir).await.unwrap();
+        tokio::fs::write(mt_dir.join("generic-bundle.zip"), b"aaaa").await.unwrap();
+        tokio::fs::write(mt_dir.join("lnvgy_fw_uefi_7d75_bundle.zip"), b"bbbbbbbb").await.unwrap();
+        let found = find_local_bundle(dir.path(), "7D75").await.unwrap().unwrap();
+        assert!(
+            found
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains("7d75")
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_bmc_exits_early_on_cancel() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(true));
+        let err = onecli_wait_bmc_ready(
+            "u",
+            "p",
+            "127.0.0.1",
+            Duration::from_secs(5),
+            true,
+            Some(&flag),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").to_ascii_lowercase().contains("cancelled"));
     }
 
     #[test]
@@ -1006,7 +1135,7 @@ mod tests {
               <Package><Name>XCC</Name><CompareResult>Current</CompareResult></Package>
             </Packages>
         "#;
-        assert_eq!(count_update_packages_in_xml(xml), 0);
+        assert_eq!(count_update_packages_in_xml(xml).unwrap(), 0);
     }
 
     #[test]
@@ -1017,7 +1146,29 @@ mod tests {
               <Package><Name>XCC</Name><CompareResult>NoUpdate</CompareResult></Package>
             </Packages>
         "#;
-        assert_eq!(count_update_packages_in_xml(xml), 1);
+        assert_eq!(count_update_packages_in_xml(xml).unwrap(), 1);
+    }
+
+    #[test]
+    fn compare_xml_unknown_result_errors() {
+        let xml = r#"
+            <Packages>
+              <Package><Name>UEFI</Name><CompareResult>WeirdState</CompareResult></Package>
+            </Packages>
+        "#;
+        assert!(count_update_packages_in_xml(xml).is_err());
+    }
+
+    #[test]
+    fn compare_xml_packages_without_result_not_all_counted() {
+        // Previously every bare <Package> was counted; now unknown/malformed fails.
+        let xml = r#"
+            <Packages>
+              <Package><Name>UEFI</Name></Package>
+            </Packages>
+        "#;
+        // No CompareResult text → needed stays 0 (package present but no update signal)
+        assert_eq!(count_update_packages_in_xml(xml).unwrap(), 0);
     }
 
     #[test]

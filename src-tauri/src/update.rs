@@ -133,7 +133,10 @@ pub async fn update_one_host(
     logs_dir: &Path,
     options: &UpdateOptions,
     on_progress: Option<&ProgressCallback>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> HostOutcome {
+    use crate::cancel::JobCancel;
+
     let notify = |status: &str, serial: Option<&str>, detail: &str| {
         if let Some(cb) = on_progress {
             cb(
@@ -144,6 +147,13 @@ pub async fn update_one_host(
             );
         }
     };
+
+    if cancel.is_some_and(JobCancel::is_cancelled) {
+        return HostOutcome::Skipped {
+            serial: format!("unknown-{}", host.ip),
+            reason: "cancelled".into(),
+        };
+    }
 
     let user = host.user.as_deref().unwrap_or(default_user);
     let pass = host.pass.as_deref().unwrap_or(default_pass);
@@ -275,11 +285,21 @@ pub async fn update_one_host(
         Some(&serial),
         "Waiting for BMC to return after firmware apply…",
     );
-    if let Err(e) =
-        onecli_wait_bmc_ready(user, pass, &host.ip, options.reboot_timeout, never_check_trust)
-            .await
+    if let Err(e) = onecli_wait_bmc_ready(
+        user,
+        pass,
+        &host.ip,
+        options.reboot_timeout,
+        never_check_trust,
+        cancel,
+    )
+    .await
     {
         log.error(&format!("host did not return: {e:#}"));
+        let reason = format!("{e:#}");
+        if reason.contains("cancelled") {
+            return HostOutcome::Skipped { serial, reason };
+        }
         return HostOutcome::Failed {
             serial,
             reason: format!("reboot/apply wait failed: {e:#}"),
@@ -349,7 +369,10 @@ pub async fn run_concurrent(
     concurrency: usize,
     options: UpdateOptions,
     on_progress: Option<ProgressCallback>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Vec<(String, HostOutcome)> {
+    use crate::cancel::JobCancel;
+
     let sem = Arc::new(Semaphore::new(concurrency.max(1)));
     let bundles = Arc::new(bundles_by_mt);
     let logs_dir = Arc::new(logs_dir);
@@ -359,6 +382,18 @@ pub async fn run_concurrent(
 
     let mut handles = Vec::new();
     for host in hosts {
+        if cancel.as_ref().is_some_and(|c| JobCancel::is_cancelled(c)) {
+            handles.push(tokio::spawn(async move {
+                (
+                    host.ip.clone(),
+                    HostOutcome::Skipped {
+                        serial: format!("unknown-{}", host.ip),
+                        reason: "cancelled".into(),
+                    },
+                )
+            }));
+            continue;
+        }
         let sem = Arc::clone(&sem);
         let bundles = Arc::clone(&bundles);
         let logs_dir = Arc::clone(&logs_dir);
@@ -366,6 +401,7 @@ pub async fn run_concurrent(
         let default_pass = Arc::clone(&default_pass);
         let options = Arc::clone(&options);
         let on_progress = on_progress.clone();
+        let cancel = cancel.clone();
         let ip = host.ip.clone();
         handles.push(tokio::spawn(async move {
             let _permit = match sem.acquire().await {
@@ -389,6 +425,7 @@ pub async fn run_concurrent(
                 &logs_dir,
                 &options,
                 on_progress.as_ref(),
+                cancel.as_deref(),
             )
             .await;
             (ip, outcome)
@@ -412,7 +449,6 @@ pub async fn run_concurrent(
 }
 
 /// Load hosts from a text file.
-#[allow(dead_code)]
 pub async fn load_hosts_file(path: &Path) -> Result<Vec<TargetHost>> {
     let text = tokio::fs::read_to_string(path)
         .await

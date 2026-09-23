@@ -67,6 +67,7 @@ export async function downloadBundles(args: {
   machineTypes: string[];
   firmwareDir: string;
   offline: boolean;
+  forceReacquire?: boolean;
 }): Promise<Record<string, string>> {
   return invoke("download_bundles", { request: args });
 }
@@ -82,6 +83,9 @@ export async function startUpdates(args: {
   verifyBmcTls: boolean;
   machineTypes: string[];
   bundleOverrides?: Record<string, string> | null;
+  rebootAfterStage?: boolean;
+  verifyWithCompare?: boolean;
+  resetType?: string;
 }): Promise<HostResult[]> {
   return invoke("start_updates", { request: args });
 }
@@ -103,6 +107,7 @@ export async function applyBlueprint(args: {
   applytime?: string;
   rebootAfterApply?: boolean;
   resetType?: string;
+  rebootTimeoutSecs?: number;
 }): Promise<HostResult[]> {
   return invoke("apply_blueprint", { request: args });
 }
@@ -140,6 +145,27 @@ export async function pickPackageDirectory(): Promise<string | null> {
   const selected = await open({
     directory: true,
     multiple: false,
+  });
+  if (typeof selected === "string") return selected;
+  return null;
+}
+
+export async function cancelJobs(): Promise<void> {
+  return invoke("cancel_jobs");
+}
+
+export async function loadHostsFile(path: string): Promise<string> {
+  return invoke("load_hosts_file", { path });
+}
+
+export async function openPath(path: string): Promise<void> {
+  return invoke("open_path", { path });
+}
+
+export async function pickHostsFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Host lists", extensions: ["txt", "csv", "list"] }],
   });
   if (typeof selected === "string") return selected;
   return null;

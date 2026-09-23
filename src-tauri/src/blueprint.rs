@@ -9,10 +9,13 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use crate::lenovo::{ensure_onecli, onecli_compare, onecli_identify, onecli_power_restart};
+use crate::lenovo::{
+    ensure_onecli, onecli_compare, onecli_identify, onecli_power_restart, onecli_wait_bmc_ready,
+};
 use crate::logutil::sanitize_serial;
 use crate::update::TargetHost;
 
@@ -184,22 +187,30 @@ pub fn classify_blueprint_content(ext: &str, content: &str) -> Result<BlueprintP
     }
 
     let parts = split_blueprint_parts(content);
-    let mut plan = BlueprintPlan {
+    // Only treat "raid_level=" as RAID intent when it is a real key line, not a comment.
+    let has_raid_key_line = content.lines().any(|l| {
+        let t = l.trim().to_ascii_lowercase();
+        !t.is_empty()
+            && !t.starts_with('#')
+            && !t.starts_with(';')
+            && (t.starts_with("raid_level=")
+                || t.starts_with("disks=")
+                || t.starts_with("vol_name="))
+    });
+    let plan = BlueprintPlan {
         raid: !parts.raid.trim().is_empty()
             || split_at_raid_marker(content).is_some()
-            || (ext == "ini" && lower.contains("raid_level")),
+            || has_raid_key_line,
         config_settings: !parts.settings.trim().is_empty(),
         config_batch: !parts.batch.trim().is_empty(),
         firmware_xml: false,
     };
 
-    // Comment-only .ini with raid_level mentioned in comments still maps to RAID intent.
-    if plan.is_empty() && ext == "ini" {
-        plan.raid = true;
-    }
-
     if plan.is_empty() {
-        bail!("Could not classify blueprint contents as RAID, settings, batch, or firmware XML");
+        bail!(
+            "Could not classify blueprint contents as RAID, settings, batch, or firmware XML. \
+             Add Setting=Value lines, set … batch commands, a #RAID section, or a compare XML."
+        );
     }
     Ok(plan)
 }
@@ -410,6 +421,8 @@ pub struct BlueprintApplyOptions {
     pub reboot_after_apply: bool,
     /// ForceRestart (default) or GracefulRestart.
     pub reset_type: String,
+    /// How long to wait for the BMC after restart (default 90 minutes).
+    pub reboot_timeout: Duration,
 }
 
 impl Default for BlueprintApplyOptions {
@@ -421,6 +434,7 @@ impl Default for BlueprintApplyOptions {
             applytime: "OnReset".into(),
             reboot_after_apply: true,
             reset_type: "ForceRestart".into(),
+            reboot_timeout: Duration::from_secs(90 * 60),
         }
     }
 }
@@ -446,7 +460,10 @@ pub async fn apply_blueprint_concurrent(
     concurrency: usize,
     opts: BlueprintApplyOptions,
     on_progress: Option<BlueprintProgressCb>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<BlueprintHostResult>> {
+    use crate::cancel::JobCancel;
+
     if plan.firmware_xml {
         let dir = opts
             .package_dir
@@ -466,6 +483,17 @@ pub async fn apply_blueprint_concurrent(
     let mut joins = Vec::with_capacity(hosts.len());
 
     for host in hosts {
+        if cancel.as_ref().is_some_and(|c| JobCancel::is_cancelled(c)) {
+            joins.push(tokio::spawn(async move {
+                BlueprintHostResult {
+                    ip: host.ip,
+                    serial: String::new(),
+                    outcome: "skipped".into(),
+                    detail: "cancelled".into(),
+                }
+            }));
+            continue;
+        }
         let permit = sem.clone().acquire_owned().await?;
         let onecli = onecli.clone();
         let blueprint = blueprint.clone();
@@ -474,12 +502,22 @@ pub async fn apply_blueprint_concurrent(
         let password = password.clone();
         let opts = opts.clone();
         let on_progress = on_progress.clone();
+        let cancel = cancel.clone();
 
         joins.push(tokio::spawn(async move {
             let _permit = permit;
             let ip = host.ip.clone();
             let user = host.user.as_deref().unwrap_or(&username);
             let pass = host.pass.as_deref().unwrap_or(&password);
+
+            if cancel.as_ref().is_some_and(|c| JobCancel::is_cancelled(c)) {
+                return BlueprintHostResult {
+                    ip,
+                    serial: String::new(),
+                    outcome: "skipped".into(),
+                    detail: "cancelled".into(),
+                };
+            }
 
             if let Some(cb) = &on_progress {
                 cb(
@@ -499,6 +537,7 @@ pub async fn apply_blueprint_concurrent(
                 &ip,
                 &opts,
                 on_progress.as_ref(),
+                cancel.as_deref(),
             )
             .await;
 
@@ -521,10 +560,15 @@ pub async fn apply_blueprint_concurrent(
                 }
                 Err((serial, e)) => {
                     let detail = format!("{e:#}");
+                    let outcome = if detail.to_ascii_lowercase().contains("cancelled") {
+                        "skipped"
+                    } else {
+                        "failed"
+                    };
                     if let Some(cb) = &on_progress {
                         cb(
                             ip.clone(),
-                            "failed".into(),
+                            outcome.into(),
                             if serial.is_empty() {
                                 None
                             } else {
@@ -536,7 +580,7 @@ pub async fn apply_blueprint_concurrent(
                     BlueprintHostResult {
                         ip,
                         serial,
-                        outcome: "failed".into(),
+                        outcome: outcome.into(),
                         detail,
                     }
                 }
@@ -560,8 +604,17 @@ async fn apply_blueprint_one(
     ip: &str,
     opts: &BlueprintApplyOptions,
     on_progress: Option<&BlueprintProgressCb>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(String, String), (String, anyhow::Error)> {
+    use crate::cancel::JobCancel;
+
     let fallback = format!("unknown-{}", sanitize_serial(ip));
+    if cancel.is_some_and(JobCancel::is_cancelled) {
+        return Err((
+            fallback,
+            anyhow::anyhow!("cancelled"),
+        ));
+    }
     let provisional = opts.logs_dir.join("blueprint").join(&fallback);
     tokio::fs::create_dir_all(&provisional)
         .await
@@ -778,6 +831,28 @@ async fn apply_blueprint_one(
             )
         })?;
         done.push("restart");
+
+        if let Some(cb) = on_progress {
+            cb(
+                ip.to_string(),
+                "applying".into(),
+                Some(serial.clone()),
+                "Waiting for BMC to return after restart…".into(),
+            );
+        }
+        onecli_wait_bmc_ready(
+            user,
+            pass,
+            ip,
+            opts.reboot_timeout,
+            opts.never_check_trust,
+            cancel,
+        )
+        .await
+        .map_err(|e| {
+            map_err(e.context("restarted OK but BMC did not return after wait"))
+        })?;
+        done.push("bmc ready");
     }
 
     Ok((
@@ -851,7 +926,10 @@ pub async fn verify_blueprint_concurrent(
     concurrency: usize,
     opts: BlueprintApplyOptions,
     on_progress: Option<BlueprintProgressCb>,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<BlueprintHostResult>> {
+    use crate::cancel::JobCancel;
+
     if plan.firmware_xml {
         let dir = opts
             .package_dir
@@ -871,6 +949,17 @@ pub async fn verify_blueprint_concurrent(
     let mut joins = Vec::with_capacity(hosts.len());
 
     for host in hosts {
+        if cancel.as_ref().is_some_and(|c| JobCancel::is_cancelled(c)) {
+            joins.push(tokio::spawn(async move {
+                BlueprintHostResult {
+                    ip: host.ip,
+                    serial: String::new(),
+                    outcome: "skipped".into(),
+                    detail: "cancelled".into(),
+                }
+            }));
+            continue;
+        }
         let permit = sem.clone().acquire_owned().await?;
         let onecli = onecli.clone();
         let blueprint = blueprint.clone();
@@ -1129,40 +1218,47 @@ async fn verify_config_compare(
         blob.push_str(&extra);
     }
 
-    if config_compare_reports_mismatch(&blob) {
-        bail!("{}", truncate(&blob, 500));
-    }
+    // Prefer exit status; only use text heuristics when exit is 0.
     if !output.status.success() {
-        // Non-zero without clear mismatch text — still treat as failure
+        if config_compare_reports_mismatch(&blob) {
+            bail!("{}", truncate(&blob, 500));
+        }
         bail!(
             "exit {:?} — {}",
             output.status.code(),
             truncate(&combined, 400)
         );
     }
+    if config_compare_reports_mismatch(&blob) {
+        bail!("{}", truncate(&blob, 500));
+    }
     Ok(())
 }
 
+/// True when compare output clearly reports a settings mismatch.
+/// Strong identity phrases win over bare words like "different".
 fn config_compare_reports_mismatch(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
+    if lower.contains("no difference")
+        || lower.contains("all match")
+        || lower.contains("identical")
+        || lower.contains("matches the file")
+        || lower.contains("settings match")
+    {
+        return false;
+    }
     const MARKERS: &[&str] = &[
         "not match",
         "does not match",
         "don't match",
         "mismatch",
-        "different",
         "not equal",
         "incorrect",
         "unexpected value",
+        "differ from",
+        "differs from",
+        "values differ",
     ];
-    // "compare result: same" / "identical" / "match" alone are OK
-    if lower.contains("no difference")
-        || lower.contains("all match")
-        || lower.contains("identical")
-        || lower.contains("matches the file")
-    {
-        return false;
-    }
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
@@ -1208,7 +1304,7 @@ async fn verify_raid_policy(
     let _ = tokio::fs::write(out_dir.join("raid-show-stdout.txt"), &stdout).await;
     let _ = tokio::fs::write(out_dir.join("raid-show-stderr.txt"), &stderr).await;
 
-    if !output.status.success() && blob.trim().is_empty() {
+    if !output.status.success() {
         bail!(
             "raid show failed (exit {:?}): {}",
             output.status.code(),
@@ -1216,16 +1312,15 @@ async fn verify_raid_policy(
         );
     }
 
-    let lower = blob.to_ascii_lowercase();
+    let blocks = split_raid_show_blocks(&blob);
     let mut missing = Vec::new();
     for exp in &expected {
-        // Single token (vol_name): must appear. Multi-token (raid level forms): any.
-        let ok = if exp.tokens.len() == 1 {
-            lower.contains(&exp.tokens[0].to_ascii_lowercase())
+        let ok = if blocks.is_empty() {
+            raid_expectation_matches_blob(exp, &blob)
         } else {
-            exp.tokens
+            blocks
                 .iter()
-                .any(|t| lower.contains(&t.to_ascii_lowercase()))
+                .any(|block| raid_expectation_matches_blob(exp, block))
         };
         if !ok {
             missing.push(exp.label.clone());
@@ -1239,10 +1334,55 @@ async fn verify_raid_policy(
     }
 }
 
+/// Split `misc raid show` output into per-volume-ish blocks when headers exist.
+fn split_raid_show_blocks(blob: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = String::new();
+    for line in blob.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        let is_header = (lower.starts_with('[') && lower.contains(']'))
+            || lower.contains("volume")
+            || lower.contains("virtual disk")
+            || lower.contains("vd name")
+            || (lower.starts_with("ctrl") && lower.contains("vol"));
+        if is_header && !current.trim().is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        blocks.push(current);
+    }
+    if blocks.len() <= 1 {
+        Vec::new()
+    } else {
+        blocks
+    }
+}
+
+fn raid_expectation_matches_blob(exp: &RaidExpectation, blob: &str) -> bool {
+    let lower = blob.to_ascii_lowercase();
+    let name_ok = exp
+        .vol_name
+        .as_ref()
+        .map(|n| lower.contains(&n.to_ascii_lowercase()))
+        .unwrap_or(true);
+    let level_ok = if exp.level_tokens.is_empty() {
+        true
+    } else {
+        exp.level_tokens
+            .iter()
+            .any(|t| lower.contains(&t.to_ascii_lowercase()))
+    };
+    name_ok && level_ok
+}
+
 #[derive(Debug)]
 struct RaidExpectation {
     label: String,
-    tokens: Vec<String>,
+    vol_name: Option<String>,
+    level_tokens: Vec<String>,
 }
 
 fn raid_expectations(raid_body: &str) -> Vec<RaidExpectation> {
@@ -1255,26 +1395,33 @@ fn raid_expectations(raid_body: &str) -> Vec<RaidExpectation> {
                  level: &Option<String>,
                  vol: &Option<String>,
                  out: &mut Vec<RaidExpectation>| {
-        if let Some(v) = vol {
-            out.push(RaidExpectation {
-                label: v.clone(),
-                tokens: vec![v.clone()],
-            });
+        if level.is_none() && vol.is_none() {
             return;
         }
-        if let Some(l) = level {
-            out.push(RaidExpectation {
-                label: section
-                    .clone()
-                    .unwrap_or_else(|| format!("raid{l}")),
-                // Any of these forms in raid show output is enough (checked as OR).
-                tokens: vec![
+        let level_tokens = level
+            .as_ref()
+            .map(|l| {
+                vec![
                     format!("raid {l}"),
                     format!("raid{l}"),
                     format!("raid-{l}"),
-                ],
+                ]
+            })
+            .unwrap_or_default();
+        let label = vol
+            .clone()
+            .or_else(|| section.clone())
+            .unwrap_or_else(|| {
+                level
+                    .as_ref()
+                    .map(|l| format!("raid{l}"))
+                    .unwrap_or_else(|| "raid".into())
             });
-        }
+        out.push(RaidExpectation {
+            label,
+            vol_name: vol.clone(),
+            level_tokens,
+        });
     };
 
     for line in raid_body.lines() {
@@ -1482,6 +1629,38 @@ extra_policy=WriteBack
         let exp = raid_expectations(raid);
         assert_eq!(exp.len(), 1);
         assert_eq!(exp[0].label, "os");
+        assert_eq!(exp[0].vol_name.as_deref(), Some("os"));
+        assert!(exp[0].level_tokens.iter().any(|t| t == "raid 1"));
+    }
+
+    #[test]
+    fn refuses_empty_and_comment_only_ini() {
+        assert!(classify_blueprint_content("ini", "").is_err());
+        assert!(classify_blueprint_content("ini", "# just a comment about raid_level\n").is_err());
+    }
+
+    #[test]
+    fn config_compare_mismatch_markers() {
+        assert!(config_compare_reports_mismatch("Setting X mismatch vs file"));
+        assert!(config_compare_reports_mismatch("values differ from blueprint"));
+        assert!(!config_compare_reports_mismatch(
+            "settings identical — no difference found (log said different host earlier)"
+        ));
+    }
+
+    #[test]
+    fn raid_match_requires_name_and_level_together() {
+        let exp = RaidExpectation {
+            label: "os".into(),
+            vol_name: Some("os".into()),
+            level_tokens: vec!["raid 1".into(), "raid1".into()],
+        };
+        assert!(raid_expectation_matches_blob(
+            &exp,
+            "Volume os\nRAID Level: RAID 1\n"
+        ));
+        assert!(!raid_expectation_matches_blob(&exp, "Volume os\nRAID Level: RAID 5\n"));
+        assert!(!raid_expectation_matches_blob(&exp, "Volume data\nRAID Level: RAID 1\n"));
     }
 
     #[test]

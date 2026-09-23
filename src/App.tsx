@@ -19,14 +19,18 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
   applyBlueprint,
+  cancelJobs,
   classifyBlueprint,
   downloadBundles,
   ensureOnecliReady,
   listModels,
+  loadHostsFile,
   onDownloadProgress,
   onHostProgress,
+  openPath,
   parseHosts,
   pickBlueprintFile,
+  pickHostsFile,
   pickPackageDirectory,
   resolveMachineTypes,
   startUpdates,
@@ -87,12 +91,19 @@ export default function App() {
   const [downloadLog, setDownloadLog] = useState<DownloadProgress[]>([]);
   const [downloading, setDownloading] = useState(false);
   const [offline, setOffline] = useState(false);
+  const [forceReacquire, setForceReacquire] = useState(false);
   const [firmwareDir, setFirmwareDir] = useState("firmware");
   const [logsDir, setLogsDir] = useState("logs");
   const [username, setUsername] = useState("USERID");
   const [password, setPassword] = useState("");
   const [concurrency, setConcurrency] = useState(4);
   const [verifyTls, setVerifyTls] = useState(false);
+  const [rebootAfterStage, setRebootAfterStage] = useState(true);
+  const [verifyWithCompare, setVerifyWithCompare] = useState(true);
+  const [resetType, setResetType] = useState<"ForceRestart" | "GracefulRestart">(
+    "ForceRestart"
+  );
+  const [rebootAfterApply, setRebootAfterApply] = useState(true);
   const [hostsText, setHostsText] = useState("");
   const [hostCount, setHostCount] = useState(0);
   const [running, setRunning] = useState(false);
@@ -202,6 +213,7 @@ export default function App() {
         machineTypes,
         firmwareDir,
         offline,
+        forceReacquire,
       });
       setBundles(map);
     } catch (e) {
@@ -233,6 +245,43 @@ export default function App() {
     }
   }, [hostsText]);
 
+  // Live host count while typing
+  useEffect(() => {
+    const t = setTimeout(() => {
+      void parseHosts(hostsText)
+        .then((ips) => setHostCount(ips.length))
+        .catch(() => setHostCount(0));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [hostsText]);
+
+  const loadHostsFromFile = async () => {
+    try {
+      const path = await pickHostsFile();
+      if (!path) return;
+      const text = await loadHostsFile(path);
+      setHostsText(text);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const openLogs = async () => {
+    try {
+      await openPath(logsDir);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const requestCancel = async () => {
+    try {
+      await cancelJobs();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const goRun = async () => {
     const n = await validateHosts();
     if (!n) return;
@@ -261,6 +310,43 @@ export default function App() {
         verifyBmcTls: verifyTls,
         machineTypes,
         bundleOverrides: bundles,
+        rebootAfterStage,
+        verifyWithCompare,
+        resetType,
+      });
+      setResults(res);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const retryFailedUpdates = async () => {
+    const failedIps = results
+      .filter((r) => r.outcome === "failed" || r.outcome === "mismatch")
+      .map((r) => r.ip);
+    if (failedIps.length === 0) return;
+    setHostsText(failedIps.join("\n"));
+    setError(null);
+    setRunning(true);
+    setResults([]);
+    setHostProgress({});
+    try {
+      const res = await startUpdates({
+        hostsText: failedIps.join("\n"),
+        username,
+        password,
+        concurrency,
+        firmwareDir,
+        logsDir,
+        offline,
+        verifyBmcTls: verifyTls,
+        machineTypes,
+        bundleOverrides: bundles,
+        rebootAfterStage,
+        verifyWithCompare,
+        resetType,
       });
       setResults(res);
     } catch (e) {
@@ -324,6 +410,39 @@ export default function App() {
         logsDir,
         packageDir: blueprintInfo?.needsPackageDir ? packageDir : null,
         verifyBmcTls: verifyTls,
+        rebootAfterApply,
+        resetType,
+      });
+      setBlueprintResults(res);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBlueprintRunning(false);
+    }
+  };
+
+  const retryFailedBlueprints = async () => {
+    const failedIps = blueprintResults
+      .filter((r) => r.outcome === "failed" || r.outcome === "mismatch")
+      .map((r) => r.ip);
+    if (failedIps.length === 0 || !blueprintPath) return;
+    setHostsText(failedIps.join("\n"));
+    setBlueprintRunning(true);
+    setBlueprintResults([]);
+    setBlueprintProgress({});
+    try {
+      await ensureOnecliReady();
+      const res = await applyBlueprint({
+        blueprintPath,
+        hostsText: failedIps.join("\n"),
+        username,
+        password,
+        concurrency,
+        logsDir,
+        packageDir: blueprintInfo?.needsPackageDir ? packageDir : null,
+        verifyBmcTls: verifyTls,
+        rebootAfterApply,
+        resetType,
       });
       setBlueprintResults(res);
     } catch (e) {
@@ -413,7 +532,7 @@ export default function App() {
           <Shield className="size-3.5 text-signal" />
           {mode === "firmware"
             ? "Flash → reboot → OneCLI compare"
-            : "Apply → restart hosts"}
+            : "Apply → restart → wait for BMC"}
         </div>
       </header>
 
@@ -506,8 +625,8 @@ export default function App() {
                 <span className="font-mono">set</span> commands, or a firmware
                 compare <span className="font-mono text-rack-300">.xml</span>.
                 OneRust runs settings → batch → RAID (body below{" "}
-                <span className="font-mono">#RAID</span>), then force-restarts
-                each host.
+                <span className="font-mono">#RAID</span>), force-restarts
+                each host, then waits for the BMC to return.
               </p>
             </div>
 
@@ -604,10 +723,32 @@ export default function App() {
                 />
                 <Label htmlFor="bp-tls">Verify BMC TLS certificates</Label>
               </div>
-              <div className="space-y-0">
-                <Label htmlFor="bp-logs" className="sr-only">
-                  Logs directory
-                </Label>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="bp-reboot"
+                  checked={rebootAfterApply}
+                  onCheckedChange={setRebootAfterApply}
+                />
+                <Label htmlFor="bp-reboot">Reboot after apply</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Label htmlFor="bp-reset">Reset</Label>
+                <select
+                  id="bp-reset"
+                  className="rounded-md border border-border bg-rack-900 px-2 py-1 text-sm"
+                  value={resetType}
+                  onChange={(e) =>
+                    setResetType(
+                      e.target.value as "ForceRestart" | "GracefulRestart"
+                    )
+                  }
+                  disabled={!rebootAfterApply}
+                >
+                  <option value="ForceRestart">Force</option>
+                  <option value="GracefulRestart">Graceful</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
                 <Input
                   id="bp-logs"
                   value={logsDir}
@@ -615,11 +756,24 @@ export default function App() {
                   className="h-8 w-40 font-mono text-xs"
                   title="Logs directory"
                 />
+                <Button type="button" variant="outline" size="sm" onClick={openLogs}>
+                  <FolderOpen className="size-4" />
+                </Button>
               </div>
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col gap-2">
-              <Label htmlFor="bp-hosts">BMC IP addresses</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="bp-hosts">BMC IP addresses</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={loadHostsFromFile}
+                >
+                  Load from file
+                </Button>
+              </div>
               <Textarea
                 id="bp-hosts"
                 placeholder={"10.0.0.11\n10.0.0.12\nadmin:secret@10.0.0.13"}
@@ -634,7 +788,26 @@ export default function App() {
               </p>
             </div>
 
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                variant="outline"
+                onClick={requestCancel}
+                disabled={!blueprintRunning}
+              >
+                Cancel
+              </Button>
+              <Button
+                variant="outline"
+                onClick={retryFailedBlueprints}
+                disabled={
+                  blueprintRunning ||
+                  !blueprintResults.some(
+                    (r) => r.outcome === "failed" || r.outcome === "mismatch"
+                  )
+                }
+              >
+                Retry failed
+              </Button>
               <Button
                 variant="outline"
                 onClick={runBlueprintVerify}
@@ -772,7 +945,7 @@ export default function App() {
                       : "."}
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <div className="flex items-center gap-2">
                   <Switch
                     id="offline"
@@ -780,6 +953,15 @@ export default function App() {
                     onCheckedChange={setOffline}
                   />
                   <Label htmlFor="offline">Offline (local ZIPs only)</Label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="force-acq"
+                    checked={forceReacquire}
+                    onCheckedChange={setForceReacquire}
+                    disabled={offline}
+                  />
+                  <Label htmlFor="force-acq">Force re-acquire</Label>
                 </div>
                 <Button onClick={runDownload} disabled={downloading}>
                   {downloading ? "Acquiring…" : "Acquire with OneCLI"}
@@ -799,12 +981,17 @@ export default function App() {
               </div>
               <div className="space-y-2">
                 <Label htmlFor="logdir">Logs directory</Label>
-                <Input
-                  id="logdir"
-                  value={logsDir}
-                  onChange={(e) => setLogsDir(e.target.value)}
-                  className="font-mono"
-                />
+                <div className="flex gap-2">
+                  <Input
+                    id="logdir"
+                    value={logsDir}
+                    onChange={(e) => setLogsDir(e.target.value)}
+                    className="font-mono"
+                  />
+                  <Button type="button" variant="outline" onClick={openLogs}>
+                    <FolderOpen className="size-4" />
+                  </Button>
+                </div>
               </div>
             </div>
 
@@ -892,17 +1079,63 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
-              <Switch
-                id="tls"
-                checked={verifyTls}
-                onCheckedChange={setVerifyTls}
-              />
-              <Label htmlFor="tls">Verify BMC TLS certificates</Label>
+            <div className="flex flex-wrap items-center gap-4">
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="tls"
+                  checked={verifyTls}
+                  onCheckedChange={setVerifyTls}
+                />
+                <Label htmlFor="tls">Verify BMC TLS certificates</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="reboot-stage"
+                  checked={rebootAfterStage}
+                  onCheckedChange={setRebootAfterStage}
+                />
+                <Label htmlFor="reboot-stage">Reboot after stage</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="verify-compare"
+                  checked={verifyWithCompare}
+                  onCheckedChange={setVerifyWithCompare}
+                  disabled={!rebootAfterStage}
+                />
+                <Label htmlFor="verify-compare">Verify with compare</Label>
+              </div>
+              <div className="flex items-center gap-2">
+                <Label htmlFor="reset-type">Reset</Label>
+                <select
+                  id="reset-type"
+                  className="rounded-md border border-border bg-rack-900 px-2 py-1 text-sm"
+                  value={resetType}
+                  onChange={(e) =>
+                    setResetType(
+                      e.target.value as "ForceRestart" | "GracefulRestart"
+                    )
+                  }
+                  disabled={!rebootAfterStage}
+                >
+                  <option value="ForceRestart">Force</option>
+                  <option value="GracefulRestart">Graceful</option>
+                </select>
+              </div>
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col gap-2">
-              <Label htmlFor="hosts">BMC IP addresses</Label>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor="hosts">BMC IP addresses</Label>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={loadHostsFromFile}
+                >
+                  Load from file
+                </Button>
+              </div>
               <Textarea
                 id="hosts"
                 placeholder={"10.0.0.11\n10.0.0.12\nadmin:secret@10.0.0.13"}
@@ -938,9 +1171,30 @@ export default function App() {
                   <span className="font-mono text-rack-300">{logsDir}/</span>
                 </p>
               </div>
-              <Button onClick={runUpdates} disabled={running}>
-                {running ? "Updating…" : "Start update"}
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  onClick={requestCancel}
+                  disabled={!running}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={retryFailedUpdates}
+                  disabled={
+                    running ||
+                    !results.some(
+                      (r) => r.outcome === "failed" || r.outcome === "mismatch"
+                    )
+                  }
+                >
+                  Retry failed
+                </Button>
+                <Button onClick={runUpdates} disabled={running}>
+                  {running ? "Updating…" : "Start update"}
+                </Button>
+              </div>
             </div>
 
             <Separator />

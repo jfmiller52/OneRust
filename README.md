@@ -37,7 +37,7 @@ All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 - Network reachability to target XCC/BMC IPs
 - For development: [Node.js](https://nodejs.org/) 20+, [Rust](https://rustup.rs/) (stable, MSVC)
 
-On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable, OneRust downloads Lenovo OneCLI and extracts it into `OneCLI/` next to the app.
+On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable, OneRust downloads a **pinned** Lenovo OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, then extracts it into `OneCLI/` next to the app. To bump OneCLI, update `ONECLI_DOWNLOAD_URL` and `ONECLI_ZIP_SHA256` together in `src-tauri/src/lenovo.rs`.
 
 ## Install (release)
 
@@ -109,7 +109,8 @@ vol_name=os
 1. `config replicate` (settings lines above `#RAID`)
 2. `config batch` (`set …` lines above `#RAID`, if present)
 3. `misc raid add --force` (verbatim body below `#RAID`)
-4. **Force-restart** each host (`misc power forcerestart`) so applied settings take effect
+4. **Force-restart** each host (`misc power forcerestart`)
+5. **Wait for BMC** (`misc power state` until the host answers again)
 
 Verify does **not** reboot.
 

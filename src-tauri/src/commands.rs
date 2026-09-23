@@ -4,6 +4,7 @@ use crate::blueprint::{
     apply_blueprint_concurrent, classify_blueprint_file, plan_from_override,
     verify_blueprint_concurrent, BlueprintApplyOptions,
 };
+use crate::cancel::JobCancel;
 use crate::catalog::{
     machine_types_from_selection, model_name_for_mt, MODELS,
 };
@@ -12,7 +13,8 @@ use crate::update::{parse_hosts_text, run_concurrent, HostOutcome, TargetHost, U
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, State};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +68,8 @@ pub struct DownloadRequest {
     pub machine_types: Vec<String>,
     pub firmware_dir: String,
     pub offline: bool,
+    #[serde(default)]
+    pub force_reacquire: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,7 +233,9 @@ pub async fn download_bundles(
             },
         );
 
-        match acquire_bundle_for_mt(mt, &firmware_dir, request.offline).await {
+        match acquire_bundle_for_mt(mt, &firmware_dir, request.offline, request.force_reacquire)
+            .await
+        {
             Ok(path) => {
                 let path_str = path.display().to_string();
                 let _ = app.emit(
@@ -271,6 +277,7 @@ pub async fn download_bundles(
 #[tauri::command]
 pub async fn start_updates(
     app: AppHandle,
+    cancel: State<'_, JobCancel>,
     request: UpdateRequest,
 ) -> Result<Vec<HostResultDto>, String> {
     let hosts: Vec<TargetHost> =
@@ -302,7 +309,7 @@ pub async fn start_updates(
         if bundles_by_mt.contains_key(mt) {
             continue;
         }
-        let path = acquire_bundle_for_mt(mt, &firmware_dir, request.offline)
+        let path = acquire_bundle_for_mt(mt, &firmware_dir, request.offline, false)
             .await
             .map_err(|e| format!("Bundle for {mt}: {e:#}"))?;
         bundles_by_mt.insert(mt.clone(), path);
@@ -311,6 +318,8 @@ pub async fn start_updates(
     if bundles_by_mt.is_empty() {
         return Err("No firmware bundles available".into());
     }
+
+    let cancel_flag = cancel.begin();
 
     for h in &hosts {
         let _ = app.emit(
@@ -353,6 +362,7 @@ pub async fn start_updates(
             ..UpdateOptions::default()
         },
         Some(on_progress),
+        Some(cancel_flag),
     )
     .await;
 
@@ -426,10 +436,17 @@ pub struct BlueprintApplyRequest {
     /// ForceRestart (default) or GracefulRestart.
     #[serde(default = "default_reset_type")]
     pub reset_type: String,
+    /// Seconds to wait for BMC after restart (default 5400 = 90 min).
+    #[serde(default = "default_reboot_timeout_secs")]
+    pub reboot_timeout_secs: u64,
 }
 
 fn default_applytime() -> String {
     "OnReset".into()
+}
+
+fn default_reboot_timeout_secs() -> u64 {
+    90 * 60
 }
 
 #[tauri::command]
@@ -450,6 +467,7 @@ pub async fn classify_blueprint(path: String) -> Result<BlueprintInfo, String> {
 #[tauri::command]
 pub async fn apply_blueprint(
     app: AppHandle,
+    cancel: State<'_, JobCancel>,
     request: BlueprintApplyRequest,
 ) -> Result<Vec<HostResultDto>, String> {
     let path = PathBuf::from(&request.blueprint_path);
@@ -476,6 +494,8 @@ pub async fn apply_blueprint(
     if request.password.is_empty() {
         return Err("Password is required".into());
     }
+
+    let cancel_flag = cancel.begin();
 
     for h in &hosts {
         let _ = app.emit(
@@ -517,8 +537,10 @@ pub async fn apply_blueprint(
             applytime: request.applytime,
             reboot_after_apply: request.reboot_after_apply,
             reset_type: request.reset_type,
+            reboot_timeout: Duration::from_secs(request.reboot_timeout_secs.max(60)),
         },
         Some(on_progress),
+        Some(cancel_flag),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
@@ -551,6 +573,7 @@ pub async fn apply_blueprint(
 #[tauri::command]
 pub async fn verify_blueprint(
     app: AppHandle,
+    cancel: State<'_, JobCancel>,
     request: BlueprintApplyRequest,
 ) -> Result<Vec<HostResultDto>, String> {
     let path = PathBuf::from(&request.blueprint_path);
@@ -577,6 +600,8 @@ pub async fn verify_blueprint(
     if request.password.is_empty() {
         return Err("Password is required".into());
     }
+
+    let cancel_flag = cancel.begin();
 
     for h in &hosts {
         let _ = app.emit(
@@ -618,8 +643,10 @@ pub async fn verify_blueprint(
             applytime: request.applytime,
             reboot_after_apply: false,
             reset_type: request.reset_type,
+            reboot_timeout: Duration::from_secs(request.reboot_timeout_secs.max(60)),
         },
         Some(on_progress),
+        Some(cancel_flag),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
@@ -647,4 +674,34 @@ pub async fn verify_blueprint(
         });
     }
     Ok(dtos)
+}
+
+#[tauri::command]
+pub fn cancel_jobs(cancel: State<'_, JobCancel>) {
+    cancel.request_cancel();
+}
+
+#[tauri::command]
+pub async fn load_hosts_file(path: String) -> Result<String, String> {
+    let hosts = crate::update::load_hosts_file(std::path::Path::new(&path))
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let lines: Vec<String> = hosts
+        .into_iter()
+        .map(|h| match (h.user, h.pass) {
+            (Some(u), Some(p)) => format!("{u}:{p}@{}", h.ip),
+            (Some(u), None) => format!("{u}@{}", h.ip),
+            _ => h.ip,
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+#[tauri::command]
+pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path, None::<&str>)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
