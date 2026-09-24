@@ -1,74 +1,100 @@
+<p align="center">
+  <img src="src-tauri/icons/128x128.png" alt="OneRust" width="96" height="96">
+</p>
+
 # OneRust
 
-Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — powered entirely by **Lenovo XClarity Essentials OneCLI**.
+Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — powered entirely by [Lenovo XClarity Essentials OneCLI](https://support.lenovo.com/us/en/solutions/ht116433).
 
-OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply / verify RAID + UEFI/BMC blueprints without hand-running CLI scripts per host.
+[![CI](https://img.shields.io/github/actions/workflow/status/jfmiller52/OneRust/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/jfmiller52/OneRust/actions)
+[![Release](https://img.shields.io/github/v/release/jfmiller52/OneRust?style=flat-square)](https://github.com/jfmiller52/OneRust/releases/latest)
+[![Windows](https://img.shields.io/badge/Windows-x64-0078D4?style=flat-square&logo=windows&logoColor=white)](https://github.com/jfmiller52/OneRust/releases)
+[![Tauri](https://img.shields.io/badge/Tauri-2-FFC131?style=flat-square&logo=tauri&logoColor=black)](https://tauri.app/)
+[![Rust](https://img.shields.io/badge/Rust-stable-dea584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
 
-**Current release:** [v1.0.0](https://github.com/jfmiller52/OneRust/releases/tag/v1.0.0)
+[Overview](#overview) • [Install](#install) • [Develop](#develop) • [Firmware update](#firmware-update) • [Blueprint](#blueprint) • [Layout](#layout) • [Notes](#notes)
 
-## What it does
+Mass-update firmware and apply or verify RAID + UEFI/BMC blueprints across many hosts — without hand-running OneCLI scripts per BMC.
 
-| Mode | Purpose |
-|------|---------|
-| **Firmware update** | Acquire Update Bundles, flash out-of-band (`--bundle` / `OnReset`), reboot, verify with OneCLI compare |
-| **Blueprint** | Apply **or verify** settings and/or RAID blueprints against many BMCs — separate files or combined with `#RAID` |
+> [!NOTE]
+> All BMC work goes through OneCLI subprocesses. There is **no Redfish client** in the app.
 
-All BMC work goes through OneCLI. There is **no Redfish client** in the app.
+## Overview
 
-### What’s new in 1.0.0
+OneRust is a Tauri + React desktop UI around Lenovo OneCLI. Pick ThinkSystem V3/V4 models, acquire Update Bundles, flash out-of-band, reboot, and verify — or push settings / RAID policies from local blueprint files.
 
-- Separate pickers for **settings/firmware** and **RAID** blueprints
-- When both are selected, apply settings then RAID and **restart once** after both succeed
-- Combined `#RAID` files still work if the RAID picker is left empty
-- Fleet hardening from 0.3.x (verify, cancel, reboot wait, OneCLI SHA-256 pin, CI)
+| Mode | What it does |
+|------|----------------|
+| **Firmware update** | Acquire bundles → flash (`--bundle` / `OnReset`) → reboot → OneCLI compare |
+| **Blueprint** | Apply or verify settings and/or RAID against many BMCs |
 
-## Prerequisites
+On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRust downloads a **pinned** OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, and extracts it next to the app.
 
-- **Windows** (OneCLI packaging and helpers are Windows-oriented)
-- Network reachability to target XCC/BMC IPs
-- For development: [Node.js](https://nodejs.org/) 20+, [Rust](https://rustup.rs/) (stable, MSVC)
+## Features
 
-On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable, OneRust downloads a **pinned** Lenovo OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, then extracts it into `OneCLI/` next to the app. To bump OneCLI, update `ONECLI_DOWNLOAD_URL` and `ONECLI_ZIP_SHA256` together in `src-tauri/src/lenovo.rs`.
+- **Fleet firmware updates** — catalog of ThinkSystem V3/V4 machine types, concurrent flash, reboot, and compare verify
+- **Blueprint apply & verify** — separate pickers for settings/firmware and RAID, or a combined `#RAID` file
+- **One reboot when both apply** — settings then RAID, restart only after both succeed
+- **Cancel in-flight jobs** — stop a running fleet job cleanly
+- **Per-host credentials** — shared XCC user/password, or `user:pass@ip` overrides
+- **Pinned OneCLI bootstrap** — URL + SHA-256 checked on first run
+- **Local logs** — OneCLI stdout/stderr under `logs/` by serial
 
-## Install (release)
+## Install
 
-Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
+Download the latest build from [Releases](https://github.com/jfmiller52/OneRust/releases/latest):
 
 - `OneRust_1.0.0_x64-setup.exe` (NSIS), or
 - `OneRust_1.0.0_x64_en-US.msi`
 
-Launch the app once so OneCLI can bootstrap if needed.
+Launch once so OneCLI can bootstrap if needed.
+
+> [!IMPORTANT]
+> OneRust targets **Windows x64**. You need network reachability to target XCC/BMC IPs.
 
 ## Develop
 
+**Prerequisites:** [Node.js](https://nodejs.org/) 20+, [Rust](https://rustup.rs/) (stable, MSVC toolchain).
+
 ```powershell
-cd C:\OneRust
+git clone https://github.com/jfmiller52/OneRust.git
+cd OneRust
 npm install
 npm run tauri dev
 ```
 
-Release build:
+Release build (produces NSIS + MSI under the Cargo target `bundle/` tree):
 
 ```powershell
 npm run tauri build
 ```
 
+Frontend-only check:
+
+```powershell
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+To bump the bundled OneCLI version, update `ONECLI_DOWNLOAD_URL` and `ONECLI_ZIP_SHA256` together in `src-tauri/src/lenovo.rs`.
+
 ## Firmware update
 
-Wizard steps: **Models → Firmware → Targets → Update**.
+Wizard: **Models → Firmware → Targets → Update**.
 
-1. **Models** — Pick ThinkSystem V3/V4 families from the catalog, and/or enter extra 4-character machine types.
+1. **Models** — Select ThinkSystem V3/V4 families from the catalog, and/or enter extra 4-character machine types.
 2. **Firmware** — Acquire latest firmware-only ZIPs with OneCLI `update acquire` into `firmware/<MT>/`. Offline mode uses local ZIPs only.
-3. **Targets** — Shared XCC user/password, concurrency, optional TLS verify, and BMC IPs (`user:pass@ip` per-host overrides allowed).
-4. **Update** — For each host, OneCLI:
+3. **Targets** — Shared XCC credentials, concurrency, optional TLS verify, and BMC IPs (`user:pass@ip` per-host overrides allowed).
+4. **Update** — For each host:
 
-| Step | Command |
-|------|---------|
+| Step | OneCLI |
+|------|--------|
 | Identify serial + machine type | `inventory getinfor --device system_overview` |
 | Stage bundle | `update flash --bundle --applytime OnReset --noreboot` |
 | Reboot | `misc power forcerestart` (or `normalrestart` when graceful) |
 | Wait for BMC | poll `misc power state` |
-| Verify | `update compare` — **verified** only when no further firmware updates are recommended |
+| Verify | `update compare` — **verified** only when no further updates are recommended |
 
 Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
@@ -78,19 +104,18 @@ Switch to the **Blueprint** tab. Choose a settings / firmware blueprint and/or a
 
 When both a settings blueprint and a RAID file are selected, OneRust applies settings first, then RAID, and **restarts the host only once after both succeed**.
 
-### Separate settings + RAID files
+### Separate settings + RAID
 
 | Picker | Typical contents |
 |--------|------------------|
 | Settings / firmware blueprint | BMC/UEFI `Setting=Value` lines, `set …` batch lines, or firmware compare `.xml` |
 | RAID settings (`.ini`) | OneCLI RAID sample format (`[ctrl…]` sections) |
 
-Either picker alone is enough. If both are set, the separate RAID file is used (embedded `#RAID` in the settings file is ignored for apply/verify).
+Either picker alone is enough. If both are set, the separate RAID file is used (embedded `#RAID` in the settings file is ignored for that run).
 
 ### Combined settings + RAID file
 
-You can still put BMC/UEFI settings (and optional `set …` batch lines) **above** a `#RAID` marker in one file and leave the RAID picker empty.
-**Everything below `#RAID`** is written to a temporary `.ini` and sent with `misc raid add --force` — use OneCLI’s RAID sample format as-is.
+Put BMC/UEFI settings (and optional `set …` batch lines) **above** a `#RAID` marker and leave the RAID picker empty. Everything below the marker is written verbatim to a temp INI for `misc raid add --force`.
 
 ```ini
 # BMC / UEFI (from config save, or hand-edited Setting=Value lines)
@@ -104,38 +129,28 @@ raid_level=1
 vol_name=os
 ```
 
-`# RAID` (with a space) or `#RAID: …` also works as the marker. RAID-only files (no marker) still work when they use `[ctrl…]` sections — or pick them in the RAID settings box.
+`# RAID` (with a space) or `#RAID: …` also works. RAID-only files without a marker still work when they use `[ctrl…]` sections — or pick them in the RAID settings box.
 
-**Apply** runs, in order:
+**Apply** order:
 
 1. `config replicate` (settings lines)
 2. `config batch` (`set …` lines, if present)
 3. `misc raid add --force` (separate RAID file, or body below `#RAID`)
-4. **Force-restart** each host **once** (`misc power forcerestart`) — only after all selected steps succeed
-5. **Wait for BMC** (`misc power state` until the host answers again)
+4. Force-restart **once** (`misc power forcerestart`) — only after all selected steps succeed
+5. Wait for BMC (`misc power state`)
 
 Verify does **not** reboot.
 
-| Detected part | Apply action |
-|---------------|--------------|
-| Settings (`Setting=Value`) | `config replicate` |
-| Batch (`set …`) | `config batch` |
-| Separate RAID `.ini` or body below `#RAID` | `misc raid add --force` |
-| Firmware compare `.xml` | `update flash --comparexml` (needs a package directory) |
+| Part | Apply | Verify |
+|------|-------|--------|
+| Settings (`Setting=Value`) | `config replicate` | `config compare --file` |
+| Batch (`set …`) | `config batch` | converted to `Setting=Value`, then compare |
+| RAID (file or `#RAID` body) | `misc raid add --force` | `misc raid show` (vol name / level) |
+| Firmware compare `.xml` | `update flash --comparexml` | `update compare` (needs package dir) |
 
-### Verify against hosts
+Outcomes: **applied** / **verified** / **mismatch** / **failed**. Details under `logs/blueprint/<serial>/`.
 
-Read-only check of the live BMC against the same blueprint(s):
-
-| Part | Verify method |
-|------|----------------|
-| Settings / batch | `config compare --file` (batch `set` lines converted to `Setting=Value`) |
-| RAID | `misc raid show`, then look for expected `vol_name` / RAID level |
-| Firmware XML | `update compare` against the package directory (pass when no updates remain) |
-
-Outcomes: **verified**, **mismatch**, or **failed**. Details under `logs/blueprint/<serial>/verify/`.
-
-Suggested layout for your own library:
+Suggested library layout:
 
 ```text
 blueprints/
@@ -168,11 +183,22 @@ OneRust/
 
 ## Notes
 
+> [!TIP]
+> TLS verification is **off** by default (`--never-check-trust`). Turn on **Verify BMC TLS** in the UI when you need certificate checks.
+
 - Designed for **ThinkSystem V3/V4** out-of-band management through XCC.
-- TLS verification is **off** by default (`--never-check-trust`). Turn on “Verify BMC TLS” in the UI when you need certificate checks.
 - OneCLI, firmware trees, and logs are gitignored — keep them local to each workstation.
 - HTTP is used only to download the OneCLI zip on first run; day-to-day BMC operations are OneCLI subprocesses.
+- CI runs frontend build + `cargo test` on Windows (`main` pushes and PRs).
 
-## License
+## Troubleshooting
 
-MIT
+| Symptom | What to check |
+|---------|----------------|
+| OneCLI setup failed | Network to Lenovo download URL; SHA-256 mismatch means bump URL + hash together |
+| Host skipped (firmware) | Machine type not in selection / no ZIP under `firmware/<MT>/` |
+| Blueprint verify mismatch | Diff under `logs/blueprint/<serial>/verify/`; RAID expectations need `vol_name` / `raid_level` |
+| BMC never returns after reboot | Reachability and credentials; wait timeout defaults to 90 minutes |
+| Empty INI refused | Settings / RAID files must contain real content, not comments only |
+
+If something else breaks, [open an issue](https://github.com/jfmiller52/OneRust/issues) with the relevant `logs/` snippets (redact passwords).
