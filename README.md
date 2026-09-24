@@ -4,7 +4,7 @@ Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — po
 
 OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and apply / verify RAID + UEFI/BMC blueprints without hand-running CLI scripts per host.
 
-**Current release:** [v0.3.2](https://github.com/jfmiller52/OneRust/releases/tag/v0.3.2)
+**Current release:** [v1.0.0](https://github.com/jfmiller52/OneRust/releases/tag/v1.0.0)
 
 ## What it does
 
@@ -15,21 +15,12 @@ OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and a
 
 All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 
-### What’s new in 0.3.2
+### What’s new in 1.0.0
 
-- Combined blueprints use an explicit **`#RAID`** marker: everything below it is written verbatim to a temp INI for `misc raid add`
-- Settings / batch lines stay above `#RAID`; RAID-only files without a marker still work
-
-### From 0.3.1
-
-- After a successful **blueprint apply**, each host is **force-restarted** (`misc power forcerestart`) so settings take effect
-- Verify against hosts remains read-only (no reboot)
-
-### From 0.3.0
-
-- Combined **settings + RAID** in a single blueprint file
-- **Verify against hosts** on the Blueprint tab (read-only checks via OneCLI)
-- Outcomes: applied / verified / mismatch / failed, with logs under `logs/blueprint/<serial>/`
+- Separate pickers for **settings/firmware** and **RAID** blueprints
+- When both are selected, apply settings then RAID and **restart once** after both succeed
+- Combined `#RAID` files still work if the RAID picker is left empty
+- Fleet hardening from 0.3.x (verify, cancel, reboot wait, OneCLI SHA-256 pin, CI)
 
 ## Prerequisites
 
@@ -43,8 +34,8 @@ On **first launch**, if `OneCLI/OneCli.exe` is not already beside the executable
 
 Download from [Releases](https://github.com/jfmiller52/OneRust/releases):
 
-- `OneRust_0.3.2_x64-setup.exe` (NSIS), or
-- `OneRust_0.3.2_x64_en-US.msi`
+- `OneRust_1.0.0_x64-setup.exe` (NSIS), or
+- `OneRust_1.0.0_x64_en-US.msi`
 
 Launch the app once so OneCLI can bootstrap if needed.
 
