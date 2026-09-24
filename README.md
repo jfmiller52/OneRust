@@ -11,7 +11,7 @@ OneRust wraps OneCLI in a Tauri + React UI so you can mass-update firmware and a
 | Mode | Purpose |
 |------|---------|
 | **Firmware update** | Acquire Update Bundles, flash out-of-band (`--bundle` / `OnReset`), reboot, verify with OneCLI compare |
-| **Blueprint** | Apply **or verify** a local `.ini` / `.xml` / `.txt` against many BMCs — settings and RAID can share one file |
+| **Blueprint** | Apply **or verify** settings and/or RAID blueprints against many BMCs — separate files or combined with `#RAID` |
 
 All BMC work goes through OneCLI. There is **no Redfish client** in the app.
 
@@ -83,11 +83,22 @@ Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
 ## Blueprint
 
-Switch to the **Blueprint** tab. Choose a file; OneRust classifies its parts and can **Apply** or **Verify against hosts**.
+Switch to the **Blueprint** tab. Choose a settings / firmware blueprint and/or a separate RAID `.ini`, then **Apply** or **Verify against hosts**.
+
+When both a settings blueprint and a RAID file are selected, OneRust applies settings first, then RAID, and **restarts the host only once after both succeed**.
+
+### Separate settings + RAID files
+
+| Picker | Typical contents |
+|--------|------------------|
+| Settings / firmware blueprint | BMC/UEFI `Setting=Value` lines, `set …` batch lines, or firmware compare `.xml` |
+| RAID settings (`.ini`) | OneCLI RAID sample format (`[ctrl…]` sections) |
+
+Either picker alone is enough. If both are set, the separate RAID file is used (embedded `#RAID` in the settings file is ignored for apply/verify).
 
 ### Combined settings + RAID file
 
-Put BMC/UEFI settings (and optional `set …` batch lines) **above** a `#RAID` marker.
+You can still put BMC/UEFI settings (and optional `set …` batch lines) **above** a `#RAID` marker in one file and leave the RAID picker empty.
 **Everything below `#RAID`** is written to a temporary `.ini` and sent with `misc raid add --force` — use OneCLI’s RAID sample format as-is.
 
 ```ini
@@ -102,28 +113,28 @@ raid_level=1
 vol_name=os
 ```
 
-`# RAID` (with a space) or `#RAID: …` also works as the marker. RAID-only files (no marker) still work when they use `[ctrl…]` sections.
+`# RAID` (with a space) or `#RAID: …` also works as the marker. RAID-only files (no marker) still work when they use `[ctrl…]` sections — or pick them in the RAID settings box.
 
-**Apply** splits the file and runs, in order:
+**Apply** runs, in order:
 
-1. `config replicate` (settings lines above `#RAID`)
-2. `config batch` (`set …` lines above `#RAID`, if present)
-3. `misc raid add --force` (verbatim body below `#RAID`)
-4. **Force-restart** each host (`misc power forcerestart`)
+1. `config replicate` (settings lines)
+2. `config batch` (`set …` lines, if present)
+3. `misc raid add --force` (separate RAID file, or body below `#RAID`)
+4. **Force-restart** each host **once** (`misc power forcerestart`) — only after all selected steps succeed
 5. **Wait for BMC** (`misc power state` until the host answers again)
 
 Verify does **not** reboot.
 
 | Detected part | Apply action |
 |---------------|--------------|
-| Lines above `#RAID` (`Setting=Value`) | `config replicate` |
-| Lines above `#RAID` (`set …`) | `config batch` |
-| Body below `#RAID` (or RAID-only `[ctrl…]` file) | `misc raid add --force` |
-| Firmware compare `.xml` | `update flash --comparexml` (needs a package directory; separate file) |
+| Settings (`Setting=Value`) | `config replicate` |
+| Batch (`set …`) | `config batch` |
+| Separate RAID `.ini` or body below `#RAID` | `misc raid add --force` |
+| Firmware compare `.xml` | `update flash --comparexml` (needs a package directory) |
 
 ### Verify against hosts
 
-Read-only check of the live BMC against the same blueprint:
+Read-only check of the live BMC against the same blueprint(s):
 
 | Part | Verify method |
 |------|----------------|
@@ -137,7 +148,9 @@ Suggested layout for your own library:
 
 ```text
 blueprints/
-  sr650v3-baseline.ini      # settings + RAID together
+  sr650v3-settings.ini      # BMC/UEFI settings
+  sr650v3-raid.ini          # RAID policy
+  sr650v3-baseline.ini      # optional: settings + #RAID together
   batch/
     ldap.txt                # set … lines only
   firmware/

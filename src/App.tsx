@@ -32,6 +32,7 @@ import {
   pickBlueprintFile,
   pickHostsFile,
   pickPackageDirectory,
+  pickRaidFile,
   resolveMachineTypes,
   startUpdates,
   verifyBlueprint,
@@ -114,6 +115,7 @@ export default function App() {
 
   // Blueprint mode
   const [blueprintPath, setBlueprintPath] = useState("");
+  const [raidPath, setRaidPath] = useState("");
   const [blueprintInfo, setBlueprintInfo] = useState<BlueprintInfo | null>(null);
   const [packageDir, setPackageDir] = useState("firmware");
   const [blueprintRunning, setBlueprintRunning] = useState(false);
@@ -370,6 +372,17 @@ export default function App() {
     }
   };
 
+  const chooseRaidFile = async () => {
+    setError(null);
+    try {
+      const path = await pickRaidFile();
+      if (!path) return;
+      setRaidPath(path);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const choosePackageDir = async () => {
     try {
       const path = await pickPackageDirectory();
@@ -381,8 +394,8 @@ export default function App() {
 
   const runBlueprint = async () => {
     setError(null);
-    if (!blueprintPath) {
-      setError("Choose a blueprint file (.ini / .xml / .txt).");
+    if (!blueprintPath && !raidPath) {
+      setError("Choose a settings blueprint and/or a RAID settings (.ini) file.");
       return;
     }
     const n = await validateHosts();
@@ -402,7 +415,8 @@ export default function App() {
     try {
       await ensureOnecliReady();
       const res = await applyBlueprint({
-        blueprintPath,
+        blueprintPath: blueprintPath || null,
+        raidPath: raidPath || null,
         hostsText,
         username,
         password,
@@ -425,7 +439,7 @@ export default function App() {
     const failedIps = blueprintResults
       .filter((r) => r.outcome === "failed" || r.outcome === "mismatch")
       .map((r) => r.ip);
-    if (failedIps.length === 0 || !blueprintPath) return;
+    if (failedIps.length === 0 || (!blueprintPath && !raidPath)) return;
     setHostsText(failedIps.join("\n"));
     setBlueprintRunning(true);
     setBlueprintResults([]);
@@ -433,7 +447,8 @@ export default function App() {
     try {
       await ensureOnecliReady();
       const res = await applyBlueprint({
-        blueprintPath,
+        blueprintPath: blueprintPath || null,
+        raidPath: raidPath || null,
         hostsText: failedIps.join("\n"),
         username,
         password,
@@ -454,8 +469,8 @@ export default function App() {
 
   const runBlueprintVerify = async () => {
     setError(null);
-    if (!blueprintPath) {
-      setError("Choose a blueprint file (.ini / .xml / .txt).");
+    if (!blueprintPath && !raidPath) {
+      setError("Choose a settings blueprint and/or a RAID settings (.ini) file.");
       return;
     }
     const n = await validateHosts();
@@ -475,7 +490,8 @@ export default function App() {
     try {
       await ensureOnecliReady();
       const res = await verifyBlueprint({
-        blueprintPath,
+        blueprintPath: blueprintPath || null,
+        raidPath: raidPath || null,
         hostsText,
         username,
         password,
@@ -614,25 +630,25 @@ export default function App() {
             <div>
               <h2 className="text-lg font-medium">Apply blueprint</h2>
               <p className="mt-1 text-sm text-rack-400">
-                Choose an{" "}
+                Choose a settings blueprint (
                 <span className="font-mono text-rack-300">.ini</span> /{" "}
-                <span className="font-mono text-rack-300">.txt</span> that can
-                include BMC/UEFI settings and RAID policy in the{" "}
-                <span className="font-medium text-rack-300">same file</span>{" "}
-                (settings above a{" "}
-                <span className="font-mono text-rack-300">#RAID</span> marker),
-                a <span className="font-mono">config batch</span> of{" "}
-                <span className="font-mono">set</span> commands, or a firmware
-                compare <span className="font-mono text-rack-300">.xml</span>.
-                OneRust runs settings → batch → RAID (body below{" "}
-                <span className="font-mono">#RAID</span>), force-restarts
-                each host, then waits for the BMC to return.
+                <span className="font-mono text-rack-300">.txt</span> /{" "}
+                <span className="font-mono text-rack-300">.xml</span>) and
+                optionally a separate RAID{" "}
+                <span className="font-mono text-rack-300">.ini</span>. When both
+                are selected, OneRust applies settings then RAID, and{" "}
+                <span className="font-medium text-rack-300">
+                  restarts once after both succeed
+                </span>
+                . Combined files with a{" "}
+                <span className="font-mono text-rack-300">#RAID</span> marker
+                still work if you leave the RAID picker empty.
               </p>
             </div>
 
             <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
               <div className="space-y-2">
-                <Label>Blueprint file</Label>
+                <Label>Settings / firmware blueprint</Label>
                 <Input
                   readOnly
                   value={blueprintPath}
@@ -641,6 +657,22 @@ export default function App() {
                 />
               </div>
               <Button variant="outline" onClick={chooseBlueprint}>
+                <FolderOpen className="size-4" />
+                Browse
+              </Button>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+              <div className="space-y-2">
+                <Label>RAID settings (.ini)</Label>
+                <Input
+                  readOnly
+                  value={raidPath}
+                  placeholder="Optional — select raid.ini…"
+                  className="font-mono"
+                />
+              </div>
+              <Button variant="outline" onClick={chooseRaidFile}>
                 <FolderOpen className="size-4" />
                 Browse
               </Button>

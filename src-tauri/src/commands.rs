@@ -417,7 +417,12 @@ pub struct BlueprintInfo {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlueprintApplyRequest {
-    pub blueprint_path: String,
+    /// Settings / batch / firmware XML blueprint (optional if `raid_path` is set).
+    #[serde(default)]
+    pub blueprint_path: Option<String>,
+    /// Separate RAID policy `.ini` (optional). Applied after settings; one reboot covers both.
+    #[serde(default)]
+    pub raid_path: Option<String>,
     pub hosts_text: String,
     pub username: String,
     pub password: String,
@@ -439,6 +444,12 @@ pub struct BlueprintApplyRequest {
     /// Seconds to wait for BMC after restart (default 5400 = 90 min).
     #[serde(default = "default_reboot_timeout_secs")]
     pub reboot_timeout_secs: u64,
+}
+
+fn optional_path(raw: Option<&String>) -> Option<PathBuf> {
+    raw.map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 fn default_applytime() -> String {
@@ -464,25 +475,67 @@ pub async fn classify_blueprint(path: String) -> Result<BlueprintInfo, String> {
     })
 }
 
+fn resolve_blueprint_inputs(
+    request: &BlueprintApplyRequest,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let blueprint = optional_path(request.blueprint_path.as_ref());
+    let raid = optional_path(request.raid_path.as_ref());
+    if blueprint.is_none() && raid.is_none() {
+        return Err("Choose a settings blueprint and/or a RAID settings file".into());
+    }
+    if let Some(path) = &blueprint {
+        if !path.is_file() {
+            return Err(format!("Blueprint file not found: {}", path.display()));
+        }
+    }
+    if let Some(path) = &raid {
+        if !path.is_file() {
+            return Err(format!("RAID file not found: {}", path.display()));
+        }
+    }
+    Ok((blueprint, raid))
+}
+
+async fn resolve_blueprint_plan(
+    blueprint: Option<&PathBuf>,
+    kind_override: Option<&String>,
+) -> Result<crate::blueprint::BlueprintPlan, String> {
+    if let Some(over) = kind_override {
+        return plan_from_override(over).map_err(|e| format!("{e:#}"));
+    }
+    if let Some(path) = blueprint {
+        return Ok(classify_blueprint_file(path)
+            .await
+            .map_err(|e| format!("{e:#}"))?
+            .plan);
+    }
+    Ok(crate::blueprint::BlueprintPlan::default())
+}
+
+fn blueprint_job_label(plan: &crate::blueprint::BlueprintPlan, has_raid: bool) -> String {
+    let mut parts = Vec::new();
+    if !plan.is_empty() {
+        parts.push(plan.label());
+    }
+    if has_raid {
+        parts.push("RAID policy".into());
+    }
+    if parts.is_empty() {
+        "Blueprint".into()
+    } else {
+        parts.join(" + ")
+    }
+}
+
 #[tauri::command]
 pub async fn apply_blueprint(
     app: AppHandle,
     cancel: State<'_, JobCancel>,
     request: BlueprintApplyRequest,
 ) -> Result<Vec<HostResultDto>, String> {
-    let path = PathBuf::from(&request.blueprint_path);
-    if !path.is_file() {
-        return Err(format!("Blueprint file not found: {}", path.display()));
-    }
-
-    let plan = if let Some(over) = &request.kind_override {
-        plan_from_override(over).map_err(|e| format!("{e:#}"))?
-    } else {
-        classify_blueprint_file(&path)
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .plan
-    };
+    let (blueprint, raid_path) = resolve_blueprint_inputs(&request)?;
+    let plan = resolve_blueprint_plan(blueprint.as_ref(), request.kind_override.as_ref()).await?;
+    let label = blueprint_job_label(&plan, raid_path.is_some());
 
     let hosts = parse_hosts_text(&request.hosts_text).map_err(|e| e.to_string())?;
     if hosts.is_empty() {
@@ -504,7 +557,7 @@ pub async fn apply_blueprint(
                 ip: h.ip.clone(),
                 serial: None,
                 status: "queued".into(),
-                detail: format!("Waiting to apply {}…", plan.label()),
+                detail: format!("Waiting to apply {label}…"),
             },
         );
     }
@@ -524,7 +577,7 @@ pub async fn apply_blueprint(
         });
 
     let results = apply_blueprint_concurrent(
-        path,
+        blueprint,
         plan,
         hosts,
         request.username,
@@ -538,6 +591,7 @@ pub async fn apply_blueprint(
             reboot_after_apply: request.reboot_after_apply,
             reset_type: request.reset_type,
             reboot_timeout: Duration::from_secs(request.reboot_timeout_secs.max(60)),
+            raid_path,
         },
         Some(on_progress),
         Some(cancel_flag),
@@ -576,19 +630,9 @@ pub async fn verify_blueprint(
     cancel: State<'_, JobCancel>,
     request: BlueprintApplyRequest,
 ) -> Result<Vec<HostResultDto>, String> {
-    let path = PathBuf::from(&request.blueprint_path);
-    if !path.is_file() {
-        return Err(format!("Blueprint file not found: {}", path.display()));
-    }
-
-    let plan = if let Some(over) = &request.kind_override {
-        plan_from_override(over).map_err(|e| format!("{e:#}"))?
-    } else {
-        classify_blueprint_file(&path)
-            .await
-            .map_err(|e| format!("{e:#}"))?
-            .plan
-    };
+    let (blueprint, raid_path) = resolve_blueprint_inputs(&request)?;
+    let plan = resolve_blueprint_plan(blueprint.as_ref(), request.kind_override.as_ref()).await?;
+    let label = blueprint_job_label(&plan, raid_path.is_some());
 
     let hosts = parse_hosts_text(&request.hosts_text).map_err(|e| e.to_string())?;
     if hosts.is_empty() {
@@ -610,7 +654,7 @@ pub async fn verify_blueprint(
                 ip: h.ip.clone(),
                 serial: None,
                 status: "queued".into(),
-                detail: format!("Waiting to verify {}…", plan.label()),
+                detail: format!("Waiting to verify {label}…"),
             },
         );
     }
@@ -630,7 +674,7 @@ pub async fn verify_blueprint(
         });
 
     let results = verify_blueprint_concurrent(
-        path,
+        blueprint,
         plan,
         hosts,
         request.username,
@@ -644,6 +688,7 @@ pub async fn verify_blueprint(
             reboot_after_apply: false,
             reset_type: request.reset_type,
             reboot_timeout: Duration::from_secs(request.reboot_timeout_secs.max(60)),
+            raid_path,
         },
         Some(on_progress),
         Some(cancel_flag),

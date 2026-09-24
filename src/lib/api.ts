@@ -95,7 +95,8 @@ export async function classifyBlueprint(path: string): Promise<BlueprintInfo> {
 }
 
 export async function applyBlueprint(args: {
-  blueprintPath: string;
+  blueprintPath?: string | null;
+  raidPath?: string | null;
   hostsText: string;
   username: string;
   password: string;
@@ -113,7 +114,8 @@ export async function applyBlueprint(args: {
 }
 
 export async function verifyBlueprint(args: {
-  blueprintPath: string;
+  blueprintPath?: string | null;
+  raidPath?: string | null;
   hostsText: string;
   username: string;
   password: string;
@@ -134,6 +136,20 @@ export async function pickBlueprintFile(): Promise<string | null> {
       {
         name: "Blueprints",
         extensions: ["ini", "xml", "txt"],
+      },
+    ],
+  });
+  if (typeof selected === "string") return selected;
+  return null;
+}
+
+export async function pickRaidFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    filters: [
+      {
+        name: "RAID settings",
+        extensions: ["ini"],
       },
     ],
   });

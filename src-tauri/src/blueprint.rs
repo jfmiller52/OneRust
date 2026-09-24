@@ -1,9 +1,11 @@
 //! Apply OneCLI XML/INI "blueprints" (RAID, BMC/UEFI settings, firmware compare).
 //!
-//! A single `.ini` / `.txt` file may contain both UEFI/BMC settings and RAID policy.
-//! Prefer an explicit `#RAID` marker: everything below it is written to a temp
-//! INI and applied with `misc raid add`. Without a marker, OneRust falls back
-//! to section/key heuristics.
+//! Settings and RAID may be separate files, or combined in one `.ini` / `.txt`.
+//! Prefer an explicit `#RAID` marker in combined files: everything below it is
+//! written to a temp INI and applied with `misc raid add`. A separate RAID file
+//! (via `BlueprintApplyOptions::raid_path`) is applied after settings; reboot
+//! waits until both complete. Without a marker, OneRust falls back to
+//! section/key heuristics.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -423,6 +425,8 @@ pub struct BlueprintApplyOptions {
     pub reset_type: String,
     /// How long to wait for the BMC after restart (default 90 minutes).
     pub reboot_timeout: Duration,
+    /// Optional separate RAID policy file (applied after settings; reboot waits for both).
+    pub raid_path: Option<PathBuf>,
 }
 
 impl Default for BlueprintApplyOptions {
@@ -435,6 +439,7 @@ impl Default for BlueprintApplyOptions {
             reboot_after_apply: true,
             reset_type: "ForceRestart".into(),
             reboot_timeout: Duration::from_secs(90 * 60),
+            raid_path: None,
         }
     }
 }
@@ -450,9 +455,12 @@ pub struct BlueprintHostResult {
 /// Progress callback: (ip, status, serial, detail)
 pub type BlueprintProgressCb = Arc<dyn Fn(String, String, Option<String>, String) + Send + Sync>;
 
-/// Apply one blueprint file to many hosts concurrently.
+/// Apply settings and/or RAID blueprints to many hosts concurrently.
+///
+/// `blueprint` is the settings/batch/firmware file (optional if `opts.raid_path` is set).
+/// When both are present, RAID is applied after settings and a single reboot runs at the end.
 pub async fn apply_blueprint_concurrent(
-    blueprint: PathBuf,
+    blueprint: Option<PathBuf>,
     plan: BlueprintPlan,
     hosts: Vec<TargetHost>,
     username: String,
@@ -464,6 +472,9 @@ pub async fn apply_blueprint_concurrent(
 ) -> Result<Vec<BlueprintHostResult>> {
     use crate::cancel::JobCancel;
 
+    if plan.is_empty() && opts.raid_path.is_none() {
+        bail!("No settings blueprint or RAID file to apply");
+    }
     if plan.firmware_xml {
         let dir = opts
             .package_dir
@@ -471,6 +482,11 @@ pub async fn apply_blueprint_concurrent(
             .context("Firmware XML blueprints require a package directory (--dir)")?;
         if !dir.exists() {
             bail!("Package directory not found: {}", dir.display());
+        }
+    }
+    if let Some(raid) = &opts.raid_path {
+        if !raid.is_file() {
+            bail!("RAID file not found: {}", raid.display());
         }
     }
 
@@ -519,18 +535,33 @@ pub async fn apply_blueprint_concurrent(
                 };
             }
 
+            let label = {
+                let mut parts = Vec::new();
+                if !plan.is_empty() {
+                    parts.push(plan.label());
+                }
+                if opts.raid_path.is_some() {
+                    parts.push("RAID policy".into());
+                }
+                if parts.is_empty() {
+                    "Blueprint".into()
+                } else {
+                    parts.join(" + ")
+                }
+            };
+
             if let Some(cb) = &on_progress {
                 cb(
                     ip.clone(),
                     "running".into(),
                     None,
-                    format!("Applying {}…", plan.label()),
+                    format!("Applying {label}…"),
                 );
             }
 
             let result = apply_blueprint_one(
                 &onecli,
-                &blueprint,
+                blueprint.as_deref(),
                 &plan,
                 user,
                 pass,
@@ -597,7 +628,7 @@ pub async fn apply_blueprint_concurrent(
 
 async fn apply_blueprint_one(
     onecli: &Path,
-    blueprint: &Path,
+    blueprint: Option<&Path>,
     plan: &BlueprintPlan,
     user: &str,
     pass: &str,
@@ -610,10 +641,7 @@ async fn apply_blueprint_one(
 
     let fallback = format!("unknown-{}", sanitize_serial(ip));
     if cancel.is_some_and(JobCancel::is_cancelled) {
-        return Err((
-            fallback,
-            anyhow::anyhow!("cancelled"),
-        ));
+        return Err((fallback, anyhow::anyhow!("cancelled")));
     }
     let provisional = opts.logs_dir.join("blueprint").join(&fallback);
     tokio::fs::create_dir_all(&provisional)
@@ -647,12 +675,6 @@ async fn apply_blueprint_one(
             map_err(anyhow::Error::new(e).context(format!("create {}", out_dir.display())))
         })?;
 
-    let content = tokio::fs::read_to_string(blueprint)
-        .await
-        .map_err(|e| {
-            map_err(anyhow::Error::new(e).context(format!("read {}", blueprint.display())))
-        })?;
-    let parts = split_blueprint_parts(&content);
     let parts_dir = out_dir.join("_parts");
     tokio::fs::create_dir_all(&parts_dir)
         .await
@@ -663,11 +685,30 @@ async fn apply_blueprint_one(
     let bmc = format!("{user}:{pass}@{ip}");
     let mut done = Vec::new();
 
-    // Order: settings → batch → RAID → firmware XML
+    // Separate RAID file takes precedence over RAID embedded in the settings blueprint.
+    let external_raid = opts.raid_path.is_some();
+    let mut plan = plan.clone();
+    if external_raid {
+        plan.raid = false;
+    }
+
+    let (content, parts) = if let Some(bp) = blueprint {
+        let content = tokio::fs::read_to_string(bp).await.map_err(|e| {
+            map_err(anyhow::Error::new(e).context(format!("read {}", bp.display())))
+        })?;
+        let parts = split_blueprint_parts(&content);
+        (Some(content), parts)
+    } else {
+        (None, BlueprintParts::default())
+    };
+
+    // Order: settings → batch → RAID (external or embedded) → firmware XML → reboot once
     if plan.config_settings {
+        let content = content
+            .as_ref()
+            .ok_or_else(|| map_err(anyhow::anyhow!("settings blueprint path required")))?;
         let path = parts_dir.join("settings.txt");
         let body = if parts.settings.trim().is_empty() {
-            // Fallback: use whole file if classification said settings-only
             content.clone()
         } else {
             parts.settings.clone()
@@ -700,6 +741,9 @@ async fn apply_blueprint_one(
     }
 
     if plan.config_batch {
+        let content = content
+            .as_ref()
+            .ok_or_else(|| map_err(anyhow::anyhow!("batch blueprint path required")))?;
         let path = parts_dir.join("batch.txt");
         let body = if parts.batch.trim().is_empty() {
             content.clone()
@@ -733,7 +777,11 @@ async fn apply_blueprint_one(
         done.push("config batch");
     }
 
+    // Embedded RAID (only when no separate RAID file)
     if plan.raid {
+        let content = content
+            .as_ref()
+            .ok_or_else(|| map_err(anyhow::anyhow!("RAID blueprint path required")))?;
         let path = parts_dir.join("raid.ini");
         let body = if parts.raid.trim().is_empty() {
             content.clone()
@@ -769,13 +817,64 @@ async fn apply_blueprint_one(
         done.push("raid add");
     }
 
-    if plan.firmware_xml {
-        let package_dir = opts
-            .package_dir
-            .as_ref()
-            .ok_or_else(|| {
-                map_err(anyhow::anyhow!("package directory required for firmware XML"))
+    // Separate RAID.ini — applied after settings so one reboot covers both
+    if let Some(raid_src) = &opts.raid_path {
+        if cancel.is_some_and(JobCancel::is_cancelled) {
+            return Err((serial, anyhow::anyhow!("cancelled")));
+        }
+        if let Some(cb) = on_progress {
+            cb(
+                ip.to_string(),
+                "running".into(),
+                Some(serial.clone()),
+                "Applying RAID policy…".into(),
+            );
+        }
+        let raid_body = tokio::fs::read_to_string(raid_src).await.map_err(|e| {
+            map_err(anyhow::Error::new(e).context(format!("read {}", raid_src.display())))
+        })?;
+        if raid_body.trim().is_empty() {
+            return Err(map_err(anyhow::anyhow!(
+                "RAID file is empty: {}",
+                raid_src.display()
+            )));
+        }
+        let path = parts_dir.join("raid.ini");
+        tokio::fs::write(&path, &raid_body)
+            .await
+            .map_err(|e| {
+                map_err(anyhow::Error::new(e).context(format!("write {}", path.display())))
             })?;
+        run_onecli(
+            onecli,
+            &[
+                "misc",
+                "raid",
+                "add",
+                "--bmc",
+                &bmc,
+                "--file",
+                &path.to_string_lossy(),
+                "--force",
+                "--quiet",
+                "--output",
+                &out_dir.to_string_lossy(),
+            ],
+            opts.never_check_trust,
+            &out_dir,
+            "raid-add",
+        )
+        .await
+        .map_err(map_err)?;
+        done.push("raid add");
+    }
+
+    if plan.firmware_xml {
+        let bp = blueprint
+            .ok_or_else(|| map_err(anyhow::anyhow!("firmware XML blueprint path required")))?;
+        let package_dir = opts.package_dir.as_ref().ok_or_else(|| {
+            map_err(anyhow::anyhow!("package directory required for firmware XML"))
+        })?;
         run_onecli(
             onecli,
             &[
@@ -784,7 +883,7 @@ async fn apply_blueprint_one(
                 "--bmc",
                 &bmc,
                 "--comparexml",
-                &blueprint.to_string_lossy(),
+                &bp.to_string_lossy(),
                 "--dir",
                 &package_dir.to_string_lossy(),
                 "--bundle",
@@ -803,6 +902,7 @@ async fn apply_blueprint_one(
         done.push("flash --comparexml");
     }
 
+    // Single reboot after all apply steps (settings + RAID) complete
     if opts.reboot_after_apply {
         if let Some(cb) = on_progress {
             cb(
@@ -823,12 +923,10 @@ async fn apply_blueprint_one(
         )
         .await
         .map_err(|e| {
-            map_err(
-                e.context(format!(
-                    "applied OK but restart failed ({})",
-                    opts.reset_type
-                )),
-            )
+            map_err(e.context(format!(
+                "applied OK but restart failed ({})",
+                opts.reset_type
+            )))
         })?;
         done.push("restart");
 
@@ -857,7 +955,7 @@ async fn apply_blueprint_one(
 
     Ok((
         serial,
-        format!("{} applied ({})", plan.label(), done.join(", ")),
+        format!("applied ({})", done.join(", ")),
     ))
 }
 
@@ -918,7 +1016,7 @@ pub fn plan_from_override(s: &str) -> Result<BlueprintPlan> {
 
 /// Verify a blueprint against many hosts (read-only OneCLI checks).
 pub async fn verify_blueprint_concurrent(
-    blueprint: PathBuf,
+    blueprint: Option<PathBuf>,
     plan: BlueprintPlan,
     hosts: Vec<TargetHost>,
     username: String,
@@ -930,6 +1028,9 @@ pub async fn verify_blueprint_concurrent(
 ) -> Result<Vec<BlueprintHostResult>> {
     use crate::cancel::JobCancel;
 
+    if plan.is_empty() && opts.raid_path.is_none() {
+        bail!("No settings blueprint or RAID file to verify");
+    }
     if plan.firmware_xml {
         let dir = opts
             .package_dir
@@ -937,6 +1038,11 @@ pub async fn verify_blueprint_concurrent(
             .context("Firmware XML blueprints require a package directory for verify")?;
         if !dir.exists() {
             bail!("Package directory not found: {}", dir.display());
+        }
+    }
+    if let Some(raid) = &opts.raid_path {
+        if !raid.is_file() {
+            bail!("RAID file not found: {}", raid.display());
         }
     }
 
@@ -984,8 +1090,16 @@ pub async fn verify_blueprint_concurrent(
                 );
             }
 
-            let result =
-                verify_blueprint_one(&onecli, &blueprint, &plan, user, pass, &ip, &opts).await;
+            let result = verify_blueprint_one(
+                &onecli,
+                blueprint.as_deref(),
+                &plan,
+                user,
+                pass,
+                &ip,
+                &opts,
+            )
+            .await;
 
             match result {
                 Ok((serial, outcome, detail)) => {
@@ -1029,7 +1143,7 @@ pub async fn verify_blueprint_concurrent(
 
 async fn verify_blueprint_one(
     onecli: &Path,
-    blueprint: &Path,
+    blueprint: Option<&Path>,
     plan: &BlueprintPlan,
     user: &str,
     pass: &str,
@@ -1060,10 +1174,23 @@ async fn verify_blueprint_one(
         .await
         .with_context(|| format!("create {}", out_dir.display()))?;
 
-    let content = tokio::fs::read_to_string(blueprint)
-        .await
-        .with_context(|| format!("read {}", blueprint.display()))?;
-    let parts = split_blueprint_parts(&content);
+    // Separate RAID file takes precedence over RAID embedded in the settings blueprint.
+    let external_raid = opts.raid_path.is_some();
+    let mut plan = plan.clone();
+    if external_raid {
+        plan.raid = false;
+    }
+
+    let (content, parts) = if let Some(bp) = blueprint {
+        let content = tokio::fs::read_to_string(bp)
+            .await
+            .with_context(|| format!("read {}", bp.display()))?;
+        let parts = split_blueprint_parts(&content);
+        (Some(content), parts)
+    } else {
+        (None, BlueprintParts::default())
+    };
+
     let parts_dir = out_dir.join("_parts");
     tokio::fs::create_dir_all(&parts_dir).await?;
 
@@ -1073,15 +1200,18 @@ async fn verify_blueprint_one(
 
     // Settings + batch (as Setting=Value) via config compare --file
     let mut compare_body = String::new();
-    if plan.config_settings && !parts.settings.trim().is_empty() {
-        compare_body.push_str(&parts.settings);
-        compare_body.push('\n');
-    } else if plan.config_settings {
-        // settings-only file without successful split
-        for line in content.lines() {
-            if is_settings_line(line.trim()) {
-                compare_body.push_str(line);
+    if plan.config_settings {
+        if let Some(ref content) = content {
+            if !parts.settings.trim().is_empty() {
+                compare_body.push_str(&parts.settings);
                 compare_body.push('\n');
+            } else {
+                for line in content.lines() {
+                    if is_settings_line(line.trim()) {
+                        compare_body.push_str(line);
+                        compare_body.push('\n');
+                    }
+                }
             }
         }
     }
@@ -1107,11 +1237,26 @@ async fn verify_blueprint_one(
     }
 
     if plan.raid {
+        let content = content
+            .as_ref()
+            .context("RAID content required for embedded RAID verify")?;
         let raid_body = if parts.raid.trim().is_empty() {
             content.clone()
         } else {
             parts.raid.clone()
         };
+        match verify_raid_policy(onecli, &bmc, &raid_body, &out_dir, opts.never_check_trust)
+            .await
+        {
+            Ok(msg) => ok_bits.push(msg),
+            Err(e) => bad_bits.push(format!("raid: {e:#}")),
+        }
+    }
+
+    if let Some(raid_src) = &opts.raid_path {
+        let raid_body = tokio::fs::read_to_string(raid_src)
+            .await
+            .with_context(|| format!("read {}", raid_src.display()))?;
         match verify_raid_policy(onecli, &bmc, &raid_body, &out_dir, opts.never_check_trust)
             .await
         {
