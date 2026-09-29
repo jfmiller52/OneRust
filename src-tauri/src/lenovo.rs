@@ -548,7 +548,10 @@ pub async fn onecli_identify(
     })
 }
 
-/// Stage/flash a firmware bundle with OnReset apply time (no automatic reboot).
+/// Stage/flash a firmware bundle with the given apply time.
+///
+/// OneCLI rejects `--bundle` together with `--noreboot`; reboot is handled
+/// separately via [`onecli_power_restart`] after a successful flash.
 pub async fn onecli_flash_bundle(
     bmc_user: &str,
     bmc_pass: &str,
@@ -575,7 +578,6 @@ pub async fn onecli_flash_bundle(
         "--bundle",
         "--applytime",
         applytime,
-        "--noreboot",
         "--quiet",
         "--output",
         &output_dir.to_string_lossy(),
@@ -605,7 +607,7 @@ pub async fn onecli_flash_bundle(
     }
 
     Ok(format!(
-        "OneCLI flash --bundle --applytime {applytime} --noreboot OK"
+        "OneCLI flash --bundle --applytime {applytime} OK"
     ))
 }
 

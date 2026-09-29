@@ -13,7 +13,7 @@ Windows desktop app for **Lenovo ThinkSystem** fleet ops over the BMC/XCC — po
 [![Rust](https://img.shields.io/badge/Rust-stable-dea584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev/)
 
-[Overview](#overview) • [Install](#install) • [Develop](#develop) • [Firmware update](#firmware-update) • [Blueprint](#blueprint) • [Layout](#layout) • [Notes](#notes)
+[Overview](#overview) • [Install](#install) • [Develop](#develop) • [Firmware update](#firmware-update) • [Blueprint](#blueprint) • [Layout](#layout) • [Notes](#notes) • [Troubleshooting](#troubleshooting)
 
 Mass-update firmware and apply or verify RAID + UEFI/BMC blueprints across many hosts — without hand-running OneCLI scripts per BMC.
 
@@ -26,27 +26,32 @@ OneRust is a Tauri + React desktop UI around Lenovo OneCLI. Pick ThinkSystem V3/
 
 | Mode | What it does |
 |------|----------------|
-| **Firmware update** | Acquire bundles → flash (`--bundle` / `OnReset`) → reboot → OneCLI compare |
+| **Firmware update** | Acquire bundles → flash (`--bundle` / `OnReset`) → reboot via OneCLI power → compare |
 | **Blueprint** | Apply or verify settings and/or RAID against many BMCs |
 
 On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRust downloads a **pinned** OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, and extracts it next to the app.
 
+### What’s new in 1.1.0
+
+- Firmware flash no longer passes `--noreboot` with `--bundle` (OneCLI 5.7 rejects that combo)
+- Reboot remains a separate `misc power` step after a successful flash
+
 ## Features
 
-- **Fleet firmware updates** — catalog of ThinkSystem V3/V4 machine types, concurrent flash, reboot, and compare verify
+- **Fleet firmware updates** — ThinkSystem V3/V4 catalog, concurrent flash, reboot, and compare verify
 - **Blueprint apply & verify** — separate pickers for settings/firmware and RAID, or a combined `#RAID` file
-- **One reboot when both apply** — settings then RAID, restart only after both succeed
+- **One reboot when both apply** — settings then RAID; restart only after both succeed
 - **Cancel in-flight jobs** — stop a running fleet job cleanly
 - **Per-host credentials** — shared XCC user/password, or `user:pass@ip` overrides
-- **Pinned OneCLI bootstrap** — URL + SHA-256 checked on first run
+- **Pinned OneCLI bootstrap** — download URL + SHA-256 checked on first run
 - **Local logs** — OneCLI stdout/stderr under `logs/` by serial
 
 ## Install
 
 Download the latest build from [Releases](https://github.com/jfmiller52/OneRust/releases/latest):
 
-- `OneRust_1.0.0_x64-setup.exe` (NSIS), or
-- `OneRust_1.0.0_x64_en-US.msi`
+- `OneRust_1.1.0_x64-setup.exe` (NSIS), or
+- `OneRust_1.1.0_x64_en-US.msi`
 
 Launch once so OneCLI can bootstrap if needed.
 
@@ -64,13 +69,13 @@ npm install
 npm run tauri dev
 ```
 
-Release build (produces NSIS + MSI under the Cargo target `bundle/` tree):
+Release build (NSIS + MSI under the Cargo target `bundle/` tree):
 
 ```powershell
 npm run tauri build
 ```
 
-Frontend-only check:
+Checks:
 
 ```powershell
 npm run build
@@ -91,10 +96,13 @@ Wizard: **Models → Firmware → Targets → Update**.
 | Step | OneCLI |
 |------|--------|
 | Identify serial + machine type | `inventory getinfor --device system_overview` |
-| Stage bundle | `update flash --bundle --applytime OnReset --noreboot` |
+| Stage bundle | `update flash --bundle --applytime OnReset` |
 | Reboot | `misc power forcerestart` (or `normalrestart` when graceful) |
 | Wait for BMC | poll `misc power state` |
 | Verify | `update compare` — **verified** only when no further updates are recommended |
+
+> [!NOTE]
+> OneCLI 5.7 rejects `--bundle` and `--noreboot` together. OneRust stages with `--bundle` / `OnReset`, then reboots separately with `misc power`.
 
 Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
@@ -195,6 +203,7 @@ OneRust/
 
 | Symptom | What to check |
 |---------|----------------|
+| `--bundle` / `--noreboot` cannot be specified at same time | Fixed in current source — flash uses `--bundle` only; reboot is a separate `misc power` step. Rebuild/restart the app. |
 | OneCLI setup failed | Network to Lenovo download URL; SHA-256 mismatch means bump URL + hash together |
 | Host skipped (firmware) | Machine type not in selection / no ZIP under `firmware/<MT>/` |
 | Blueprint verify mismatch | Diff under `logs/blueprint/<serial>/verify/`; RAID expectations need `vol_name` / `raid_level` |
