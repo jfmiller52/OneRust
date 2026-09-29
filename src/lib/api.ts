@@ -198,3 +198,58 @@ export function onHostProgress(
 ): Promise<UnlistenFn> {
   return listen<HostProgress>("host-progress", (e) => handler(e.payload));
 }
+
+export type AppUpdateInfo = {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  date: string | null;
+};
+
+/** Check GitHub Releases for a newer OneRust build (via signed latest.json). */
+export async function checkForAppUpdate(): Promise<AppUpdateInfo | null> {
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const { getVersion } = await import("@tauri-apps/api/app");
+  const currentVersion = await getVersion();
+  const update = await check();
+  if (!update) return null;
+  return {
+    version: update.version,
+    currentVersion,
+    notes: update.body ?? null,
+    date: update.date ?? null,
+  };
+}
+
+/**
+ * Download and install the latest update, then relaunch.
+ * On Windows the installer runs in passive mode and the app exits.
+ */
+export async function downloadAndInstallAppUpdate(
+  onProgress?: (downloaded: number, total: number | undefined) => void
+): Promise<void> {
+  const { check } = await import("@tauri-apps/plugin-updater");
+  const { relaunch } = await import("@tauri-apps/plugin-process");
+  const update = await check();
+  if (!update) {
+    throw new Error("No update available");
+  }
+  let downloaded = 0;
+  let contentLength: number | undefined;
+  await update.downloadAndInstall((event) => {
+    switch (event.event) {
+      case "Started":
+        contentLength = event.data.contentLength;
+        onProgress?.(0, contentLength);
+        break;
+      case "Progress":
+        downloaded += event.data.chunkLength;
+        onProgress?.(downloaded, contentLength);
+        break;
+      case "Finished":
+        onProgress?.(downloaded, contentLength);
+        break;
+    }
+  });
+  await relaunch();
+}

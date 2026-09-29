@@ -31,7 +31,12 @@ OneRust is a Tauri + React desktop UI around Lenovo OneCLI. Pick ThinkSystem V3/
 
 On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRust downloads a **pinned** OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, and extracts it next to the app.
 
-### What’s new in 1.2.0
+### What’s new in 1.3.0
+
+- **In-app updates** — Check for updates / Install downloads a signed NSIS build from GitHub Releases and relaunches
+- Shipping updates requires `.\scripts\build-release.ps1` (signs artifacts + writes `latest.json`)
+
+### From 1.2.0
 
 - Treat OneCLI flash exit **86** as staged success (OnReset), not a failure
 - Hide OneCLI console windows during acquire/flash/reboot/verify
@@ -51,13 +56,14 @@ On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRus
 - **Per-host credentials** — shared XCC user/password, or `user:pass@ip` overrides
 - **Pinned OneCLI bootstrap** — download URL + SHA-256 checked on first run
 - **Local logs** — OneCLI stdout/stderr under `logs/` by serial
+- **In-app updates** — check GitHub Releases and download/install a signed NSIS update
 
 ## Install
 
 Download the latest build from [Releases](https://github.com/jfmiller52/OneRust/releases/latest):
 
-- `OneRust_1.2.0_x64-setup.exe` (NSIS), or
-- `OneRust_1.2.0_x64_en-US.msi`
+- `OneRust_1.3.0_x64-setup.exe` (NSIS), or
+- `OneRust_1.3.0_x64_en-US.msi`
 
 Launch once so OneCLI can bootstrap if needed.
 
@@ -80,6 +86,30 @@ Release build (NSIS + MSI under the Cargo target `bundle/` tree):
 ```powershell
 npm run tauri build
 ```
+
+### Shipping a signed app update
+
+In-app updates need a **signed** NSIS installer plus `latest.json` on the GitHub release.
+
+1. Keep the private key at `%USERPROFILE%\.tauri\onerust.key` (already generated; **never commit it**).
+2. Bump the version in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+3. Build and generate updater files:
+
+```powershell
+.\scripts\build-release.ps1
+# or build + upload to an existing tag:
+.\scripts\build-release.ps1 -Upload -Tag v1.3.0
+```
+
+4. Ensure the release includes at least:
+   - `OneRust_*_x64-setup.exe`
+   - `OneRust_*_x64-setup.exe.sig`
+   - `latest.json`
+
+Installed apps poll `https://github.com/jfmiller52/OneRust/releases/latest/download/latest.json`.
+
+> [!IMPORTANT]
+> If you lose the private key, existing installs cannot verify new updates. The public key is embedded in `tauri.conf.json`.
 
 Checks:
 

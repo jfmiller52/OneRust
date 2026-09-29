@@ -5,6 +5,7 @@ import {
   FileCode2,
   FolderOpen,
   Play,
+  RefreshCw,
   Server,
   Shield,
 } from "lucide-react";
@@ -20,7 +21,9 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   applyBlueprint,
   cancelJobs,
+  checkForAppUpdate,
   classifyBlueprint,
+  downloadAndInstallAppUpdate,
   downloadBundles,
   ensureOnecliReady,
   listModels,
@@ -36,6 +39,7 @@ import {
   resolveMachineTypes,
   startUpdates,
   verifyBlueprint,
+  type AppUpdateInfo,
   type BlueprintInfo,
   type DownloadProgress,
   type HostProgress,
@@ -112,6 +116,11 @@ export default function App() {
   const [results, setResults] = useState<HostResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [onecliStatus, setOnecliStatus] = useState<string>("checking");
+  const [appUpdate, setAppUpdate] = useState<AppUpdateInfo | null>(null);
+  const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const [appUpdateProgress, setAppUpdateProgress] = useState<string | null>(
+    null
+  );
 
   // Blueprint mode
   const [blueprintPath, setBlueprintPath] = useState("");
@@ -143,6 +152,21 @@ export default function App() {
           setOnecliStatus("error");
           setError(`OneCLI setup failed: ${String(e)}`);
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Quiet startup check for a newer OneRust build on GitHub Releases.
+  useEffect(() => {
+    let cancelled = false;
+    checkForAppUpdate()
+      .then((info) => {
+        if (!cancelled && info) setAppUpdate(info);
+      })
+      .catch(() => {
+        // Offline / no latest.json yet — ignore on startup.
       });
     return () => {
       cancelled = true;
@@ -273,6 +297,50 @@ export default function App() {
       await openPath(logsDir);
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const checkAppUpdates = async () => {
+    setError(null);
+    setAppUpdateBusy(true);
+    setAppUpdateProgress(null);
+    try {
+      const info = await checkForAppUpdate();
+      if (!info) {
+        setAppUpdate(null);
+        setAppUpdateProgress("You're on the latest version.");
+      } else {
+        setAppUpdate(info);
+        setAppUpdateProgress(null);
+      }
+    } catch (e) {
+      setError(`Update check failed: ${String(e)}`);
+    } finally {
+      setAppUpdateBusy(false);
+    }
+  };
+
+  const installAppUpdate = async () => {
+    if (!appUpdate) return;
+    setError(null);
+    setAppUpdateBusy(true);
+    setAppUpdateProgress("Downloading update…");
+    try {
+      await downloadAndInstallAppUpdate((downloaded, total) => {
+        if (total && total > 0) {
+          const pct = Math.min(100, Math.round((downloaded / total) * 100));
+          setAppUpdateProgress(`Downloading update… ${pct}%`);
+        } else {
+          setAppUpdateProgress(
+            `Downloading update… ${(downloaded / (1024 * 1024)).toFixed(1)} MB`
+          );
+        }
+      });
+      setAppUpdateProgress("Installing… the app will restart.");
+    } catch (e) {
+      setError(`Update install failed: ${String(e)}`);
+      setAppUpdateBusy(false);
+      setAppUpdateProgress(null);
     }
   };
 
@@ -545,6 +613,36 @@ export default function App() {
           </span>
         </div>
         <div className="flex items-center gap-2 text-xs text-rack-400">
+          {appUpdate && (
+            <Button
+              type="button"
+              size="sm"
+              onClick={installAppUpdate}
+              disabled={appUpdateBusy}
+              title={appUpdate.notes ?? `Update to ${appUpdate.version}`}
+            >
+              <Download className="size-3.5" />
+              {appUpdateBusy
+                ? appUpdateProgress ?? "Updating…"
+                : `Install ${appUpdate.version}`}
+            </Button>
+          )}
+          {!appUpdate && appUpdateProgress && (
+            <span className="text-rack-400">{appUpdateProgress}</span>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={checkAppUpdates}
+            disabled={appUpdateBusy}
+            title="Check GitHub Releases for a newer OneRust build"
+          >
+            <RefreshCw
+              className={cn("size-3.5", appUpdateBusy && "animate-spin")}
+            />
+            Check for updates
+          </Button>
           <Button
             type="button"
             variant="outline"

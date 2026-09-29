@@ -13,6 +13,12 @@
 lnvgy_utl_lxce_onecli*.zip
 **/lnvgy_utl_lxce_onecli*.zip
 
+# Tauri updater signing keys (never commit)
+*.key
+!*.key.pub
+.env
+.env.*
+
 # OneCLI / firmware downloads must stay local
 /tools/
 **/tools/
