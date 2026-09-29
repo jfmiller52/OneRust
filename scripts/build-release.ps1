@@ -29,8 +29,10 @@ if (-not (Test-Path $keyPath)) {
     throw "Signing private key not found at $keyPath. Generate with: npm run tauri signer generate -- -w `$env:USERPROFILE\.tauri\onerust.key --ci"
 }
 
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
+$env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -Raw $keyPath).Trim()
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+# Prefer path if the CLI supports it; content env is the documented requirement.
+$env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
 
 Write-Host "Building with updater signatures (key: $keyPath)…"
 npm run tauri build
