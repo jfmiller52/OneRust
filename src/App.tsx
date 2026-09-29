@@ -545,6 +545,16 @@ export default function App() {
           </span>
         </div>
         <div className="flex items-center gap-2 text-xs text-rack-400">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={openLogs}
+            title={`Open ${logsDir}`}
+          >
+            <FolderOpen className="size-3.5" />
+            Open logs
+          </Button>
           <Shield className="size-3.5 text-signal" />
           {mode === "firmware"
             ? "Flash → reboot → OneCLI compare"
@@ -821,6 +831,15 @@ export default function App() {
             </div>
 
             <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={openLogs}
+                title={`Open ${logsDir}`}
+              >
+                <FolderOpen className="size-4" />
+                Open logs
+              </Button>
               <Button
                 variant="outline"
                 onClick={requestCancel}
@@ -1204,6 +1223,15 @@ export default function App() {
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={openLogs}
+                  title={`Open ${logsDir}`}
+                >
+                  <FolderOpen className="size-4" />
+                  Open logs
+                </Button>
                 <Button
                   variant="outline"
                   onClick={requestCancel}

@@ -10,6 +10,19 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+/// Hide the child process console window on Windows.
+///
+/// OneCLI is a console subsystem binary; without this flag each invoke
+/// flashes a visible black `cmd`/`OneCli.exe` window during fleet jobs.
+pub fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd;
+}
+
 /// Official OneCLI Windows package used when bootstrapping beside the app.
 pub const ONECLI_DOWNLOAD_URL: &str =
     "https://download.lenovo.com/servers/mig/2026/09/02/65219/lnvgy_utl_lxce_onecli01m-5.7.0_windows_indiv.zip";
@@ -205,7 +218,9 @@ async fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
     let ps = format!(
         "Expand-Archive -LiteralPath '{zip_str}' -DestinationPath '{dest_str}' -Force"
     );
-    let status = Command::new("powershell")
+    let mut ps_cmd = Command::new("powershell");
+    hide_console(&mut ps_cmd);
+    let status = ps_cmd
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -216,7 +231,9 @@ async fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let status = Command::new("tar")
+    let mut tar_cmd = Command::new("tar");
+    hide_console(&mut tar_cmd);
+    let status = tar_cmd
         .args([
             "-xf",
             &zip_path.to_string_lossy(),
@@ -249,7 +266,9 @@ pub async fn onecli_acquire(
         .with_context(|| format!("create {}", output_dir.display()))?;
 
     // ThinkSystem V3/V4: firmware-only ZIP update bundles
-    let status = Command::new(onecli)
+    let mut cmd = Command::new(onecli);
+    hide_console(&mut cmd);
+    let status = cmd
         .args([
             "update",
             "acquire",
@@ -406,6 +425,7 @@ pub async fn onecli_compare(
 
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
     let mut cmd = Command::new(&onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "update",
         "compare",
@@ -492,6 +512,7 @@ pub async fn onecli_identify(
 
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
     let mut cmd = Command::new(&onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "inventory",
         "getinfor",
@@ -568,6 +589,7 @@ pub async fn onecli_flash_bundle(
 
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
     let mut cmd = Command::new(&onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "update",
         "flash",
@@ -598,17 +620,85 @@ pub async fn onecli_flash_bundle(
     let _ = fs::write(output_dir.join("flash-stdout.txt"), &stdout).await;
     let _ = fs::write(output_dir.join("flash-stderr.txt"), &stderr).await;
 
-    if !output.status.success() {
-        bail!(
-            "OneCLI update flash failed (exit {:?}): {}",
-            output.status.code(),
-            truncate(&combined, 900)
-        );
+    let code = output.status.code();
+    match flash_exit_outcome(code) {
+        FlashExit::Ok | FlashExit::Staged | FlashExit::AlreadyCurrent => {
+            Ok(flash_exit_message(code, applytime))
+        }
+        FlashExit::Failed => {
+            bail!(
+                "OneCLI update flash failed (exit {:?}): {}",
+                code,
+                summarize_onecli_output(&combined, 900)
+            );
+        }
     }
+}
 
-    Ok(format!(
-        "OneCLI flash --bundle --applytime {applytime} OK"
-    ))
+/// OneCLI update-command exit classification (see Lenovo update return codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlashExit {
+    Ok,
+    /// Exit 86 — packages staged for apply-on-reset (expected with OnReset).
+    Staged,
+    /// Nothing useful to flash / already at current or later.
+    AlreadyCurrent,
+    Failed,
+}
+
+fn flash_exit_outcome(code: Option<i32>) -> FlashExit {
+    match code {
+        None | Some(0) => FlashExit::Ok,
+        // https://pubs.lenovo.com/lxce-onecli/update_returncodes
+        Some(86) => FlashExit::Staged,
+        Some(82) | Some(89) | Some(110) | Some(125) => FlashExit::AlreadyCurrent,
+        _ => FlashExit::Failed,
+    }
+}
+
+fn flash_exit_message(code: Option<i32>, applytime: &str) -> String {
+    match flash_exit_outcome(code) {
+        FlashExit::Staged => format!(
+            "OneCLI flash staged (exit 86) for applytime {applytime}"
+        ),
+        FlashExit::AlreadyCurrent => format!(
+            "OneCLI flash: no applicable updates (exit {code:?})"
+        ),
+        FlashExit::Ok | FlashExit::Failed => {
+            format!("OneCLI flash --bundle --applytime {applytime} OK")
+        }
+    }
+}
+
+/// Prefer ERROR/FAILED lines over progress-bar noise in OneCLI console output.
+fn summarize_onecli_output(text: &str, max: usize) -> String {
+    let interesting: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            // Drop common progress / spinner lines
+            if lower.contains("scanning...") || lower.contains("%[") {
+                return false;
+            }
+            lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("invalid")
+                || lower.contains("cannot")
+                || lower.contains("not found")
+                || lower.starts_with('[')
+        })
+        .collect();
+
+    let blob = if interesting.is_empty() {
+        text
+    } else {
+        // Keep the last few meaningful lines (often the real reason)
+        let start = interesting.len().saturating_sub(12);
+        &interesting[start..].join("\n")
+    };
+    truncate(blob, max)
 }
 
 /// Force- or graceful-restart a host via OneCLI power commands.
@@ -635,6 +725,7 @@ pub async fn onecli_power_restart(
 
     let bmc = format!("{bmc_user}:{bmc_pass}@{bmc_ip}");
     let mut cmd = Command::new(&onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "misc",
         "power",
@@ -710,6 +801,7 @@ pub async fn onecli_wait_bmc_ready(
         }
 
         let mut cmd = Command::new(&onecli);
+        hide_console(&mut cmd);
         cmd.args(["misc", "power", "state", "--bmc", &bmc, "--quiet"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1072,6 +1164,30 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flash_exit_86_is_staged_success() {
+        assert_eq!(flash_exit_outcome(Some(86)), FlashExit::Staged);
+        assert_eq!(flash_exit_outcome(Some(0)), FlashExit::Ok);
+        assert_eq!(flash_exit_outcome(Some(82)), FlashExit::AlreadyCurrent);
+        assert_eq!(flash_exit_outcome(Some(89)), FlashExit::AlreadyCurrent);
+        assert_eq!(flash_exit_outcome(Some(110)), FlashExit::AlreadyCurrent);
+        assert_eq!(flash_exit_outcome(Some(87)), FlashExit::Failed);
+        assert!(flash_exit_message(Some(86), "OnReset").contains("staged"));
+    }
+
+    #[test]
+    fn summarize_skips_scan_progress_bars() {
+        let raw = "\
+[WARNING]: The \"--never-check-trust\" option is being used.\n\
+Scanning... [  1%][>                                                                              ]\n\
+Scanning... [ 50%][========================================                                       ]\n\
+[ERROR] Something real went wrong\n\
+";
+        let s = summarize_onecli_output(raw, 400);
+        assert!(s.contains("Something real"));
+        assert!(!s.contains("Scanning"));
+    }
 
     #[test]
     fn bundle_name_heuristic() {

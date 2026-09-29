@@ -745,8 +745,21 @@ pub async fn load_hosts_file(path: String) -> Result<String, String> {
 #[tauri::command]
 pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+
+    let raw = PathBuf::from(path.trim());
+    let resolved = if raw.is_absolute() {
+        raw
+    } else {
+        // Relative paths (e.g. "logs") resolve beside the executable, matching
+        // where OneCLI and fleet logs land for installed builds.
+        crate::lenovo::preferred_onecli_dir()
+            .parent()
+            .map(|p| p.join(&raw))
+            .unwrap_or(raw)
+    };
+    std::fs::create_dir_all(&resolved).map_err(|e| e.to_string())?;
     app.opener()
-        .open_path(path, None::<&str>)
+        .open_path(resolved.display().to_string(), None::<&str>)
         .map_err(|e| e.to_string())?;
     Ok(())
 }

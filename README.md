@@ -31,7 +31,13 @@ OneRust is a Tauri + React desktop UI around Lenovo OneCLI. Pick ThinkSystem V3/
 
 On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRust downloads a **pinned** OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, and extracts it next to the app.
 
-### What’s new in 1.1.0
+### What’s new in 1.2.0
+
+- Treat OneCLI flash exit **86** as staged success (OnReset), not a failure
+- Hide OneCLI console windows during acquire/flash/reboot/verify
+- **Open logs** button in the header (and on update / blueprint actions)
+
+### From 1.1.0
 
 - Firmware flash no longer passes `--noreboot` with `--bundle` (OneCLI 5.7 rejects that combo)
 - Reboot remains a separate `misc power` step after a successful flash
@@ -50,8 +56,8 @@ On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRus
 
 Download the latest build from [Releases](https://github.com/jfmiller52/OneRust/releases/latest):
 
-- `OneRust_1.1.0_x64-setup.exe` (NSIS), or
-- `OneRust_1.1.0_x64_en-US.msi`
+- `OneRust_1.2.0_x64-setup.exe` (NSIS), or
+- `OneRust_1.2.0_x64_en-US.msi`
 
 Launch once so OneCLI can bootstrap if needed.
 
@@ -102,7 +108,7 @@ Wizard: **Models → Firmware → Targets → Update**.
 | Verify | `update compare` — **verified** only when no further updates are recommended |
 
 > [!NOTE]
-> OneCLI 5.7 rejects `--bundle` and `--noreboot` together. OneRust stages with `--bundle` / `OnReset`, then reboots separately with `misc power`.
+> OneCLI 5.7 rejects `--bundle` and `--noreboot` together. OneRust stages with `--bundle` / `OnReset`, then reboots separately with `misc power`. Exit code **86** means *Staged* (success for OnReset); it is not treated as a failure.
 
 Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
@@ -203,7 +209,8 @@ OneRust/
 
 | Symptom | What to check |
 |---------|----------------|
-| `--bundle` / `--noreboot` cannot be specified at same time | Fixed in current source — flash uses `--bundle` only; reboot is a separate `misc power` step. Rebuild/restart the app. |
+| `--bundle` / `--noreboot` cannot be specified at same time | Fixed — flash uses `--bundle` only; reboot is a separate `misc power` step. Rebuild/restart the app. |
+| Flash exit 86 reported as FAILED | Exit 86 means **Staged** (success with OnReset). Current builds treat it as success and continue to reboot. |
 | OneCLI setup failed | Network to Lenovo download URL; SHA-256 mismatch means bump URL + hash together |
 | Host skipped (firmware) | Machine type not in selection / no ZIP under `firmware/<MT>/` |
 | Blueprint verify mismatch | Diff under `logs/blueprint/<serial>/verify/`; RAID expectations need `vol_name` / `raid_level` |

@@ -16,7 +16,8 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::lenovo::{
-    ensure_onecli, onecli_compare, onecli_identify, onecli_power_restart, onecli_wait_bmc_ready,
+    ensure_onecli, hide_console, onecli_compare, onecli_identify, onecli_power_restart,
+    onecli_wait_bmc_ready,
 };
 use crate::logutil::sanitize_serial;
 use crate::update::TargetHost;
@@ -967,6 +968,7 @@ async fn run_onecli(
     log_stem: &str,
 ) -> Result<()> {
     let mut cmd = Command::new(onecli);
+    hide_console(&mut cmd);
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1330,6 +1332,7 @@ async fn verify_config_compare(
     never_check_trust: bool,
 ) -> Result<()> {
     let mut cmd = Command::new(onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "config",
         "compare",
@@ -1420,6 +1423,7 @@ async fn verify_raid_policy(
     }
 
     let mut cmd = Command::new(onecli);
+    hide_console(&mut cmd);
     cmd.args([
         "misc",
         "raid",
