@@ -26,12 +26,19 @@ OneRust is a Tauri + React desktop UI around Lenovo OneCLI. Pick ThinkSystem V3/
 
 | Mode | What it does |
 |------|----------------|
-| **Firmware update** | Acquire bundles → flash (`--bundle` / `OnReset`) → reboot via OneCLI power → compare |
+| **Firmware update** | Acquire bundles → flash non-LXPM → reboot → flash each LXPM/driver one-at-a-time with reboots → compare |
 | **Blueprint** | Apply or verify settings and/or RAID against many BMCs |
 
 On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRust downloads a **pinned** OneCLI Windows zip (`5.7.0`), verifies its **SHA-256**, and extracts it next to the app.
 
-### What’s new in 1.3.0
+### What’s new in 1.4.0
+
+- **Per-host console** — Click a Target IP during/after an update to open a live read-only console for that host
+- **Sequential LXPM/driver updates** — Bulk-flash excludes LXPM packages, then each LXPM/driver is flashed alone with a host restart between them (avoids BMC space exhaustion)
+- **BMC space retry** — Flash exit **84** / **115** triggers `misc rebootbmc`, a **240s** wait, and one automatic flash retry
+- Default concurrency raised to **5**
+
+### From 1.3.0
 
 - **In-app updates** — Check for updates / Install downloads a signed NSIS build from GitHub Releases and relaunches
 - Shipping updates requires `.\scripts\build-release.ps1` (signs artifacts + writes `latest.json`)
@@ -50,6 +57,8 @@ On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRus
 ## Features
 
 - **Fleet firmware updates** — ThinkSystem V3/V4 catalog, concurrent flash, reboot, and compare verify
+- **LXPM-aware staging** — non-LXPM first, then each LXPM/driver package with a reboot between
+- **Live per-host console** — click Target IP to watch OneCLI / progress output
 - **Blueprint apply & verify** — separate pickers for settings/firmware and RAID, or a combined `#RAID` file
 - **One reboot when both apply** — settings then RAID; restart only after both succeed
 - **Cancel in-flight jobs** — stop a running fleet job cleanly
@@ -62,10 +71,10 @@ On first launch, if `OneCLI/OneCli.exe` is missing beside the executable, OneRus
 
 Download the latest build from [Releases](https://github.com/jfmiller52/OneRust/releases/latest):
 
-- `OneRust_1.3.0_x64-setup.exe` (NSIS), or
-- `OneRust_1.3.0_x64_en-US.msi`
+- `OneRust_1.4.0_x64-setup.exe` (NSIS), or
+- `OneRust_1.4.0_x64_en-US.msi`
 
-Launch once so OneCLI can bootstrap if needed.
+Launch once so OneCLI can bootstrap if needed. Existing installs can use **Check for updates** in the app header.
 
 > [!IMPORTANT]
 > OneRust targets **Windows x64**. You need network reachability to target XCC/BMC IPs.
@@ -98,7 +107,7 @@ In-app updates need a **signed** NSIS installer plus `latest.json` on the GitHub
 ```powershell
 .\scripts\build-release.ps1
 # or build + upload to an existing tag:
-.\scripts\build-release.ps1 -Upload -Tag v1.3.0
+.\scripts\build-release.ps1 -Upload -Tag v1.4.0
 ```
 
 4. Ensure the release includes at least:
@@ -126,19 +135,25 @@ Wizard: **Models → Firmware → Targets → Update**.
 
 1. **Models** — Select ThinkSystem V3/V4 families from the catalog, and/or enter extra 4-character machine types.
 2. **Firmware** — Acquire latest firmware-only ZIPs with OneCLI `update acquire` into `firmware/<MT>/`. Offline mode uses local ZIPs only.
-3. **Targets** — Shared XCC credentials, concurrency, optional TLS verify, and BMC IPs (`user:pass@ip` per-host overrides allowed).
+3. **Targets** — Shared XCC credentials, concurrency (default **5**), optional TLS verify, and BMC IPs (`user:pass@ip` per-host overrides allowed).
 4. **Update** — For each host:
 
 | Step | OneCLI |
 |------|--------|
 | Identify serial + machine type | `inventory getinfor --device system_overview` |
-| Stage bundle | `update flash --bundle --applytime OnReset` |
+| Stage non-LXPM firmware | `update flash --bundle --applytime OnReset --excludeid <lxpm…>` |
 | Reboot | `misc power forcerestart` (or `normalrestart` when graceful) |
 | Wait for BMC | poll `misc power state` |
+| Each LXPM/driver (if needed) | `update flash --bundle --nocompare --includeid <id>` → reboot → wait |
 | Verify | `update compare` — **verified** only when no further updates are recommended |
+
+Click a **Target IP** in the results table to open that host’s live console (log lines + streamed OneCLI output).
 
 > [!NOTE]
 > OneCLI 5.7 rejects `--bundle` and `--noreboot` together. OneRust stages with `--bundle` / `OnReset`, then reboots separately with `misc power`. Exit code **86** means *Staged* (success for OnReset); it is not treated as a failure.
+
+> [!TIP]
+> LXPM firmware and LXPM OS-driver packages (`lxpm`, `drvln`, `drvwn`, …) are large and often trip BMC storage limits when staged together. OneRust excludes them from the bulk flash and applies them one package at a time with a restart between each.
 
 Hosts whose machine type was not selected (no matching bundle) are **skipped**.
 
@@ -216,7 +231,7 @@ OneRust/
   logs/
     <SERIAL>.log               # per-host firmware update log
     identify/                  # inventory used for identity
-    flash/<SERIAL>/            # flash command output
+    flash/<SERIAL>/            # flash command output (+ lxpm/ steps)
     power/<SERIAL>/            # reboot command output
     compare/<SERIAL>/          # compare XML / console
     blueprint/<SERIAL>/        # apply output + _parts/
@@ -241,10 +256,12 @@ OneRust/
 |---------|----------------|
 | `--bundle` / `--noreboot` cannot be specified at same time | Fixed — flash uses `--bundle` only; reboot is a separate `misc power` step. Rebuild/restart the app. |
 | Flash exit 86 reported as FAILED | Exit 86 means **Staged** (success with OnReset). Current builds treat it as success and continue to reboot. |
+| Flash exit 84 / 115 | **BMC storage full** — OneRust reboots the BMC (`misc rebootbmc`), waits **240s**, then retries flash once. Prefer 1.4.0+ so LXPM/drivers are staged one at a time. If it still fails, unmount ISOs/RDOC in XCC and retry manually. |
 | OneCLI setup failed | Network to Lenovo download URL; SHA-256 mismatch means bump URL + hash together |
 | Host skipped (firmware) | Machine type not in selection / no ZIP under `firmware/<MT>/` |
 | Blueprint verify mismatch | Diff under `logs/blueprint/<serial>/verify/`; RAID expectations need `vol_name` / `raid_level` |
 | BMC never returns after reboot | Reachability and credentials; wait timeout defaults to 90 minutes |
 | Empty INI refused | Settings / RAID files must contain real content, not comments only |
+| Console empty for a host | Open the IP after the job has started; lines stream from the host logger and OneCLI output |
 
 If something else breaks, [open an issue](https://github.com/jfmiller52/OneRust/issues) with the relevant `logs/` snippets (redact passwords).

@@ -55,6 +55,13 @@ pub struct HostProgress {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HostConsoleLine {
+    pub ip: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HostResultDto {
     pub ip: String,
     pub serial: String,
@@ -346,6 +353,11 @@ pub async fn start_updates(
             },
         );
     });
+    let app_console = app.clone();
+    let on_console: crate::update::ConsoleCallback =
+        std::sync::Arc::new(move |ip, line| {
+            let _ = app_console.emit("host-console", HostConsoleLine { ip, line });
+        });
 
     let results = run_concurrent(
         hosts,
@@ -362,6 +374,7 @@ pub async fn start_updates(
             ..UpdateOptions::default()
         },
         Some(on_progress),
+        Some(on_console),
         Some(cancel_flag),
     )
     .await;

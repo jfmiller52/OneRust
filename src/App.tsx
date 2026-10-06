@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Cpu,
   Download,
@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Server,
   Shield,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -29,6 +30,7 @@ import {
   listModels,
   loadHostsFile,
   onDownloadProgress,
+  onHostConsole,
   onHostProgress,
   openPath,
   parseHosts,
@@ -85,6 +87,152 @@ function statusColor(status: string) {
   }
 }
 
+type HostRow = {
+  ip: string;
+  serial?: string | null;
+  status: string;
+  detail: string;
+};
+
+function HostResultsTable({
+  rows,
+  empty,
+  selectedIp,
+  onSelectIp,
+}: {
+  rows: HostRow[];
+  empty: string;
+  selectedIp?: string | null;
+  onSelectIp?: (ip: string) => void;
+}) {
+  return (
+    <div className="min-h-0 flex-1 overflow-auto rounded-md border border-border bg-rack-850/60">
+      <table className="w-max min-w-full border-collapse text-left font-mono text-xs">
+        <thead className="sticky top-0 z-10 bg-rack-850">
+          <tr className="border-b border-border text-rack-400">
+            <th className="whitespace-nowrap px-3 py-2 font-medium">Target IP</th>
+            <th className="whitespace-nowrap px-3 py-2 font-medium">Status</th>
+            <th className="whitespace-nowrap px-3 py-2 font-medium">Messages</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 ? (
+            <tr>
+              <td colSpan={3} className="px-3 py-3 text-rack-400">
+                {empty}
+              </td>
+            </tr>
+          ) : (
+            rows.map((row) => {
+              const selected = selectedIp === row.ip;
+              return (
+                <tr
+                  key={row.ip}
+                  className={cn(
+                    "border-b border-border/40 last:border-b-0",
+                    selected && "bg-rack-800/80"
+                  )}
+                >
+                  <td className="whitespace-nowrap px-3 py-2 align-top">
+                    {onSelectIp ? (
+                      <button
+                        type="button"
+                        onClick={() => onSelectIp(row.ip)}
+                        className={cn(
+                          "text-left underline-offset-2 hover:underline",
+                          selected
+                            ? "text-signal"
+                            : "text-rack-100 hover:text-signal"
+                        )}
+                        title="Open host console"
+                      >
+                        {row.ip}
+                      </button>
+                    ) : (
+                      <span className="text-rack-100">{row.ip}</span>
+                    )}
+                  </td>
+                  <td
+                    className={cn(
+                      "whitespace-nowrap px-3 py-2 align-top",
+                      statusColor(row.status)
+                    )}
+                  >
+                    {row.status}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2 align-top text-rack-400">
+                    {(row.serial ? `${row.serial} · ` : "") + row.detail}
+                  </td>
+                </tr>
+              );
+            })
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const MAX_CONSOLE_LINES = 4000;
+
+function HostConsolePanel({
+  ip,
+  lines,
+  onClose,
+}: {
+  ip: string;
+  lines: string[];
+  onClose: () => void;
+}) {
+  const scrollerRef = useRef<HTMLPreElement>(null);
+  const stickRef = useRef(true);
+
+  useEffect(() => {
+    if (!stickRef.current) return;
+    const el = scrollerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [lines, ip]);
+
+  return (
+    <div className="flex min-h-[220px] flex-1 flex-col overflow-hidden rounded-md border border-border bg-rack-950">
+      <div className="flex items-center justify-between gap-3 border-b border-border bg-rack-900 px-3 py-1.5">
+        <div className="min-w-0 font-mono text-xs text-rack-300">
+          <span className="text-rack-500">console</span>{" "}
+          <span className="text-signal">{ip}</span>
+          <span className="ml-2 text-rack-600">read-only</span>
+        </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-rack-400"
+          onClick={onClose}
+          title="Close console"
+        >
+          <X className="size-3.5" />
+        </Button>
+      </div>
+      <pre
+        ref={scrollerRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stickRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        }}
+        className="m-0 min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed text-rack-300"
+      >
+        {lines.length === 0 ? (
+          <span className="text-rack-600">
+            Waiting for output from this host…
+          </span>
+        ) : (
+          lines.join("\n")
+        )}
+      </pre>
+    </div>
+  );
+}
+
 export default function App() {
   const [mode, setMode] = useState<Mode>("firmware");
   const [step, setStep] = useState<Step>("models");
@@ -101,7 +249,7 @@ export default function App() {
   const [logsDir, setLogsDir] = useState("logs");
   const [username, setUsername] = useState("USERID");
   const [password, setPassword] = useState("");
-  const [concurrency, setConcurrency] = useState(4);
+  const [concurrency, setConcurrency] = useState(5);
   const [verifyTls, setVerifyTls] = useState(false);
   const [rebootAfterStage, setRebootAfterStage] = useState(true);
   const [verifyWithCompare, setVerifyWithCompare] = useState(true);
@@ -113,6 +261,8 @@ export default function App() {
   const [hostCount, setHostCount] = useState(0);
   const [running, setRunning] = useState(false);
   const [hostProgress, setHostProgress] = useState<Record<string, HostProgress>>({});
+  const [hostConsole, setHostConsole] = useState<Record<string, string[]>>({});
+  const [consoleIp, setConsoleIp] = useState<string | null>(null);
   const [results, setResults] = useState<HostResult[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [onecliStatus, setOnecliStatus] = useState<string>("checking");
@@ -190,6 +340,16 @@ export default function App() {
       } else {
         setHostProgress((prev) => ({ ...prev, [p.ip]: p }));
       }
+    }).then((u) => unsubs.push(u));
+    onHostConsole((p) => {
+      setHostConsole((prev) => {
+        const existing = prev[p.ip] ?? [];
+        const next = [...existing, p.line];
+        if (next.length > MAX_CONSOLE_LINES) {
+          next.splice(0, next.length - MAX_CONSOLE_LINES);
+        }
+        return { ...prev, [p.ip]: next };
+      });
     }).then((u) => unsubs.push(u));
     return () => {
       unsubs.forEach((u) => u());
@@ -368,6 +528,7 @@ export default function App() {
     setRunning(true);
     setResults([]);
     setHostProgress({});
+    setHostConsole({});
     try {
       const res = await startUpdates({
         hostsText,
@@ -402,6 +563,7 @@ export default function App() {
     setRunning(true);
     setResults([]);
     setHostProgress({});
+    setHostConsole({});
     try {
       const res = await startUpdates({
         hostsText: failedIps.join("\n"),
@@ -734,7 +896,7 @@ export default function App() {
         )}
 
         {mode === "blueprint" && (
-          <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
+          <section className="mx-auto flex h-full w-full max-w-none flex-col gap-4">
             <div>
               <h2 className="text-lg font-medium">Apply blueprint</h2>
               <p className="mt-1 text-sm text-rack-400">
@@ -971,38 +1133,24 @@ export default function App() {
 
             <Separator />
 
-            <ScrollArea className="min-h-0 flex-1 rounded-md border border-border bg-rack-850/60 p-3">
-              <ul className="space-y-2 text-sm">
-                {Object.values(blueprintProgress).length === 0 &&
-                  blueprintResults.length === 0 && (
-                    <li className="text-rack-400">
-                      Per-host progress appears here after you apply or verify.
-                    </li>
-                  )}
-                {(blueprintResults.length
+            <HostResultsTable
+              empty="Per-host progress appears here after you apply or verify."
+              rows={
+                blueprintResults.length
                   ? blueprintResults.map((r) => ({
                       ip: r.ip,
                       serial: r.serial,
                       status: r.outcome,
                       detail: r.detail,
                     }))
-                  : Object.values(blueprintProgress)
-                ).map((row) => (
-                  <li
-                    key={row.ip}
-                    className="grid grid-cols-[140px_100px_1fr] gap-2 border-b border-border/40 py-2 font-mono text-xs"
-                  >
-                    <span className="text-rack-100">{row.ip}</span>
-                    <span className={statusColor(row.status)}>{row.status}</span>
-                    <span className="truncate text-rack-400">
-                      {("serial" in row && row.serial
-                        ? `${row.serial} · `
-                        : "") + row.detail}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </ScrollArea>
+                  : Object.values(blueprintProgress).map((p) => ({
+                      ip: p.ip,
+                      serial: p.serial,
+                      status: p.status,
+                      detail: p.detail,
+                    }))
+              }
+            />
 
             {blueprintResults.length > 0 && (
               <div className="flex flex-wrap gap-6 font-mono text-sm">
@@ -1309,14 +1457,15 @@ export default function App() {
         )}
 
         {mode === "firmware" && step === "run" && (
-          <section className="mx-auto flex h-full max-w-4xl flex-col gap-4">
+          <section className="mx-auto flex h-full w-full max-w-none flex-col gap-4">
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
                 <h2 className="text-lg font-medium">Update, reboot &amp; verify</h2>
                 <p className="mt-1 text-sm text-rack-400">
-                  Stages the Update Bundle via OneCLI (`--bundle` / OnReset),
-                  force-restarts each host, then runs OneCLI compare until no
-                  further firmware updates are recommended. Logs:{" "}
+                  Stages non-LXPM firmware via OneCLI (`--bundle` / OnReset),
+                  reboots, then flashes each LXPM/driver package one at a time
+                  with a restart between them. Final OneCLI compare verifies
+                  nothing remains. Logs:{" "}
                   <span className="font-mono text-rack-300">{logsDir}/</span>
                 </p>
               </div>
@@ -1357,36 +1506,52 @@ export default function App() {
 
             <Separator />
 
-            <ScrollArea className="min-h-0 flex-1 rounded-md border border-border bg-rack-850/60 p-3">
-              <ul className="space-y-2 text-sm">
-                {Object.values(hostProgress).length === 0 &&
-                  results.length === 0 && (
-                    <li className="text-rack-400">
-                      Host progress will appear here when you start.
-                    </li>
-                  )}
-                {(results.length
-                  ? results.map((r) => ({
-                      ip: r.ip,
-                      serial: r.serial,
-                      status: r.outcome,
-                      detail: r.detail,
-                    }))
-                  : Object.values(hostProgress)
-                ).map((row) => (
-                  <li
-                    key={row.ip}
-                    className="grid grid-cols-[140px_120px_1fr] gap-2 border-b border-border/40 py-2 font-mono text-xs"
-                  >
-                    <span className="text-rack-100">{row.ip}</span>
-                    <span className={statusColor(row.status)}>{row.status}</span>
-                    <span className="truncate text-rack-400">
-                      {(row.serial ? `${row.serial} · ` : "") + row.detail}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </ScrollArea>
+            <div
+              className={cn(
+                "flex min-h-0 flex-1 gap-3",
+                consoleIp ? "flex-col xl:flex-row" : "flex-col"
+              )}
+            >
+              <div
+                className={cn(
+                  "flex min-h-0 flex-col",
+                  consoleIp ? "xl:w-[42%] xl:max-w-xl" : "flex-1"
+                )}
+              >
+                <p className="mb-2 text-xs text-rack-500">
+                  Click a Target IP to open its live console.
+                </p>
+                <HostResultsTable
+                  empty="Host progress will appear here when you start."
+                  selectedIp={consoleIp}
+                  onSelectIp={(ip) =>
+                    setConsoleIp((prev) => (prev === ip ? null : ip))
+                  }
+                  rows={
+                    results.length
+                      ? results.map((r) => ({
+                          ip: r.ip,
+                          serial: r.serial,
+                          status: r.outcome,
+                          detail: r.detail,
+                        }))
+                      : Object.values(hostProgress).map((p) => ({
+                          ip: p.ip,
+                          serial: p.serial,
+                          status: p.status,
+                          detail: p.detail,
+                        }))
+                  }
+                />
+              </div>
+              {consoleIp && (
+                <HostConsolePanel
+                  ip={consoleIp}
+                  lines={hostConsole[consoleIp] ?? []}
+                  onClose={() => setConsoleIp(null)}
+                />
+              )}
+            </div>
 
             {results.length > 0 && (
               <div className="flex flex-wrap gap-6 font-mono text-sm">

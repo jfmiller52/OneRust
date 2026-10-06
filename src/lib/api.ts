@@ -26,6 +26,11 @@ export type HostProgress = {
   detail: string;
 };
 
+export type HostConsoleLine = {
+  ip: string;
+  line: string;
+};
+
 export type HostResult = {
   ip: string;
   serial: string;
@@ -197,6 +202,12 @@ export function onHostProgress(
   handler: (p: HostProgress) => void
 ): Promise<UnlistenFn> {
   return listen<HostProgress>("host-progress", (e) => handler(e.payload));
+}
+
+export function onHostConsole(
+  handler: (p: HostConsoleLine) => void
+): Promise<UnlistenFn> {
+  return listen<HostConsoleLine>("host-console", (e) => handler(e.payload));
 }
 
 export type AppUpdateInfo = {

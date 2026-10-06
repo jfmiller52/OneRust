@@ -5,7 +5,10 @@ use chrono::Local;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Optional live sink for each log line (UI console, etc.).
+pub type LineSink = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Sanitize a serial number for use as a log filename.
 pub fn sanitize_serial(serial: &str) -> String {
@@ -37,14 +40,21 @@ pub fn log_path_for(logs_dir: &Path, serial: Option<&str>, ip: &str) -> PathBuf 
 }
 
 /// Thread-safe append-only log writer for one host.
+#[derive(Clone)]
 pub struct HostLogger {
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     #[allow(dead_code)]
     pub path: PathBuf,
+    sink: Option<LineSink>,
 }
 
 impl HostLogger {
+    #[allow(dead_code)]
     pub fn create(path: PathBuf) -> Result<Self> {
+        Self::create_with_sink(path, None)
+    }
+
+    pub fn create_with_sink(path: PathBuf, sink: Option<LineSink>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create log dir {}", parent.display()))?;
@@ -55,8 +65,9 @@ impl HostLogger {
             .open(&path)
             .with_context(|| format!("open log {}", path.display()))?;
         Ok(Self {
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
             path,
+            sink,
         })
     }
 
@@ -72,12 +83,36 @@ impl HostLogger {
         self.write("ERROR", msg);
     }
 
+    /// Append a raw console/OneCLI line (no level tag).
+    pub fn out(&self, msg: &str) {
+        let msg = msg.trim_end_matches(['\r', '\n']);
+        if msg.is_empty() {
+            return;
+        }
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
+        let line = format!("[{ts}] {msg}\n");
+        self.emit(&line);
+    }
+
+    /// Callback that forwards OneCLI stdout/stderr into this logger (and UI sink).
+    pub fn pipe(&self) -> LineSink {
+        let this = self.clone();
+        Arc::new(move |line: String| this.out(&line))
+    }
+
     fn write(&self, level: &str, msg: &str) {
         let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
         let line = format!("[{ts}] [{level}] {msg}\n");
+        self.emit(&line);
+    }
+
+    fn emit(&self, line: &str) {
         if let Ok(mut f) = self.file.lock() {
             let _ = f.write_all(line.as_bytes());
             let _ = f.flush();
+        }
+        if let Some(sink) = &self.sink {
+            sink(line.trim_end_matches('\n').to_string());
         }
     }
 }

@@ -660,6 +660,7 @@ async fn apply_blueprint_one(
         ip,
         &provisional.join("_inventory"),
         opts.never_check_trust,
+        None,
     )
     .await
     {
@@ -921,6 +922,7 @@ async fn apply_blueprint_one(
             &opts.reset_type,
             &power_dir,
             opts.never_check_trust,
+            None,
         )
         .await
         .map_err(|e| {
@@ -946,6 +948,7 @@ async fn apply_blueprint_one(
             opts.reboot_timeout,
             opts.never_check_trust,
             cancel,
+            None,
         )
         .await
         .map_err(|e| {
@@ -1164,6 +1167,7 @@ async fn verify_blueprint_one(
         ip,
         &provisional.join("_inventory"),
         opts.never_check_trust,
+        None,
     )
     .await
     {
@@ -1279,6 +1283,7 @@ async fn verify_blueprint_one(
             package_dir,
             &out_dir.join("compare"),
             opts.never_check_trust,
+            None,
         )
         .await
         {
