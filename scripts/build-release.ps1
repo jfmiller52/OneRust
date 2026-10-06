@@ -29,10 +29,11 @@ if (-not (Test-Path $keyPath)) {
     throw "Signing private key not found at $keyPath. Generate with: npm run tauri signer generate -- -w `$env:USERPROFILE\.tauri\onerust.key --ci"
 }
 
+# Content env only — do not also set TAURI_SIGNING_PRIVATE_KEY_PATH or
+# `tauri signer` errors with "cannot be used with --private-key".
 $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -Raw $keyPath).Trim()
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
-# Prefer path if the CLI supports it; content env is the documented requirement.
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = $keyPath
+Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PATH -ErrorAction SilentlyContinue
 
 Write-Host "Building with updater signatures (key: $keyPath)…"
 npm run tauri build
@@ -47,6 +48,27 @@ $nsisExe = Join-Path $targetDir "release\bundle\nsis\OneRust_${version}_x64-setu
 $nsisSig = "$nsisExe.sig"
 $msi = Join-Path $targetDir "release\bundle\msi\OneRust_${version}_x64_en-US.msi"
 $msiSig = "$msi.sig"
+
+if (-not (Test-Path $nsisExe)) { throw "Missing build artifact: $nsisExe" }
+
+# If the build skipped signing (interactive password hang, etc.), sign here.
+# Prefer -f path alone (clear content env first for signer CLI).
+if (-not (Test-Path $nsisSig)) {
+    Write-Host "Signing NSIS installer…"
+    $savedKey = $env:TAURI_SIGNING_PRIVATE_KEY
+    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    npm run tauri signer sign -- $nsisExe -f $keyPath -p ""
+    if ($LASTEXITCODE -ne 0) { throw "nsis sign failed" }
+    $env:TAURI_SIGNING_PRIVATE_KEY = $savedKey
+}
+if ((Test-Path $msi) -and -not (Test-Path $msiSig)) {
+    Write-Host "Signing MSI…"
+    $savedKey = $env:TAURI_SIGNING_PRIVATE_KEY
+    Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+    npm run tauri signer sign -- $msi -f $keyPath -p ""
+    if ($LASTEXITCODE -ne 0) { throw "msi sign failed" }
+    $env:TAURI_SIGNING_PRIVATE_KEY = $savedKey
+}
 
 foreach ($p in @($nsisExe, $nsisSig)) {
     if (-not (Test-Path $p)) { throw "Missing build artifact: $p" }
